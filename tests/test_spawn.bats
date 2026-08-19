@@ -469,6 +469,16 @@ seed_resumable() {
   [ "$status" -ne 0 ]
 }
 
+@test "spawn: devin launches devin with -- (not a bare positional)" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" devin alice --project "$PROJ" --model claude-sonnet-4 --no-wait
+  [ "$status" -eq 0 ]
+  boot="$(cat "$CAPTURE")"
+  run cat "$boot"
+  [[ "$output" == *"devin --model claude-sonnet-4 --"* ]]
+  [[ "$output" == *"actas"* ]]
+}
+
 @test "spawn: prompt_arg lands after spawn-options, immediately before the prompt" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
   local opts="$TEST_SKILL_DIR/spawn_options.yaml"
