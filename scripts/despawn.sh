@@ -78,7 +78,7 @@ if [ "$FORCE" = "1" ]; then
   kill_recorded_placement >/dev/null
   # Drop the member's registration, and release its (now-stale) lock.
   if [ -n "${_proj:-}" ] && [ -n "${_type:-}" ]; then
-    "$SCRIPT_DIR/reset.sh" "$_proj" "$_type" "$NAME" >/dev/null 2>&1 || true
+    AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/reset.sh" "$_proj" "$_type" "$NAME" >/dev/null 2>&1 || true
   fi
   owner="$(actas_lock_owner "$TEAM" "$NAME")"
   [ -n "$owner" ] && actas_lock_release "$TEAM" "$NAME" "$owner" 2>/dev/null || true

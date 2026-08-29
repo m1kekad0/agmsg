@@ -125,6 +125,21 @@ _control_row_exists_for_alice() {
   [[ "$output" != *alice* ]]                        # registration dropped
 }
 
+@test "despawn --force: drops worktree registration using exact recorded placement (#84)" {
+  local wt_proj="/tmp/agmsg-despawn-wt-proj"
+  AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team bob claude-code "$wt_proj" >/dev/null
+  printf '%s\t%s\t%s\n' '%98' "$wt_proj" claude-code > "$RUN/spawn.team__bob"
+  printf 'somesid2\n' > "$RUN/actas.team__bob.session"
+
+  run bash "$SCRIPTS/despawn.sh" team leader bob --force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=forced"* ]]
+  [ ! -f "$RUN/spawn.team__bob" ]
+  [ ! -f "$RUN/actas.team__bob.session" ]
+  run bash "$SCRIPTS/identities.sh" "$wt_proj" claude-code
+  [[ "$output" != *bob* ]]
+}
+
 @test "despawn --force: errors when there is no placement record" {
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   run bash "$SCRIPTS/despawn.sh" team leader alice --force
