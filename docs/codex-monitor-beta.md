@@ -112,9 +112,9 @@ mode.
 
 ## Bridge Mechanics
 
-`codex-monitor.sh` starts (or reuses) an agmsg-managed Codex app-server socket
-under `~/.agents/skills/<cmd>/run/`, starts the out-of-sandbox bridge launcher,
-and then connects the Codex TUI to that socket with `--remote`.
+`codex-monitor.sh` starts (or reuses) an agmsg-managed Codex app-server on a
+loopback ws:// port under `~/.agents/skills/<cmd>/run/`, starts the out-of-sandbox bridge launcher,
+and then connects the Codex TUI to that port with `--remote`.
 
 Codex fires the SessionStart hook on the session's **first turn** (the first
 message you send), not the moment the TUI opens — so the bridge does not exist
@@ -132,10 +132,11 @@ connect to the unix socket (EPERM). Instead:
 1. `session-start.sh` (the hook) resolves the thread id — `CODEX_THREAD_ID` when
    set, otherwise the newest Codex rollout whose `session_meta` cwd matches the
    project (fresh / `codex exec` sessions never export `CODEX_THREAD_ID`) — and
-   writes a **request file** under `run/` (it never touches the socket).
+   writes a **request file** under `run/` (it never touches the app-server port).
 2. `codex-bridge-launcher.sh`, started by `codex-monitor.sh` **outside** the
    sandbox, reads the request file and starts `codex-bridge.js`.
-3. The bridge connects to the same app-server over **WebSocket-over-UDS**,
+3. The bridge connects to the same app-server over **WebSocket on a loopback
+   port**,
    resumes the thread, and arms `watch-once.sh` via the app-server `process/spawn`
    API (which polls the agmsg DB for unread rows, `read_at IS NULL`).
 4. On an unread message it inlines the text into a `turn/start` on that thread —
@@ -155,12 +156,12 @@ flowchart TD
   mode -- "not monitor / codex exec / --version" --> real["real codex"]
   mode -- "monitor (interactive)" --> monitor["codex-monitor.sh"]
 
-  monitor --> server{"app-server socket exists?"}
-  server -- "no" --> startServer["codex app-server --listen unix://..."]
-  server -- "yes" --> reuseServer["reuse socket"]
-  monitor --> launcher["codex-bridge-launcher.sh (outside sandbox)"]
-  startServer --> remote["codex --remote unix://..."]
-  reuseServer --> remote
+   monitor --> server{"app-server port record exists?"}
+   server -- "no" --> startServer["codex app-server --listen ws://127.0.0.1:0"]
+   server -- "yes" --> reuseServer["reuse port when pid + cmdline + version check out"]
+   monitor --> launcher["codex-bridge-launcher.sh (outside sandbox)"]
+   startServer --> remote["codex --remote ws://127.0.0.1:<port>"]
+   reuseServer --> remote
 
   remote --> hook["SessionStart hook → session-start.sh (in sandbox)"]
   hook --> thread["resolve thread: CODEX_THREAD_ID || newest matching rollout"]
