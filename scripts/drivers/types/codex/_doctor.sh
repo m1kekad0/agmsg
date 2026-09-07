@@ -40,7 +40,13 @@ if ! command -v agmsg_role_session_load >/dev/null 2>&1; then
   . "$SKILL_DIR/scripts/lib/role-session.sh"
 fi
 
-# Per-run caches, kept in the sourcing shell (never inside a substitution).
+# Best-effort memo for the current `codex --version` answer. NOTE on scope:
+# doctor.sh invokes both entry points below inside command substitutions, so
+# anything assigned here never travels back to the parent shell — the memo
+# only dedupes probes WITHIN one entry-point call (e.g. several unattributed
+# hashes in one global scan), and each per-pair call probes once. That is
+# accepted as is: one `codex --version` per codex pair is cheap, and hoisting
+# the probe into the parent is deliberately not done (no optimization).
 _AGMSG_CODEX_DOCTOR_VERSION_PROBED=""
 _AGMSG_CODEX_DOCTOR_VERSION=""
 _CODEX_DOCTOR_KNOWN_HASHES=""
@@ -81,9 +87,10 @@ _codex_doctor_port_alive() {
   (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
 }
 
-# Current `codex --version` output, resolved once per doctor run through the
-# same override the monitor honors. Empty when unreadable — every version
-# verdict below treats that as "cannot tell", never as a mismatch.
+# Current `codex --version` output, resolved once per entry-point call (see
+# the memo note above) through the same override the monitor honors. Empty
+# when unreadable — every version verdict below treats that as "cannot
+# tell", never as a mismatch.
 _codex_doctor_current_version() {
   [ -n "$_AGMSG_CODEX_DOCTOR_VERSION_PROBED" ] && return 0
   _AGMSG_CODEX_DOCTOR_VERSION_PROBED=1
@@ -228,6 +235,18 @@ _codex_doctor_eval_appserver() {
   if [ "$pid_state" = "none" ] && [ "$have_portf" -eq 1 ]; then
     echo "WARN: app-server endpoint record exists but the pid record is missing (incomplete state)"
   fi
+  if [ "$pid_state" = "none" ] && [ "$have_portf" -eq 0 ] && [ "$have_verf" -eq 1 ]; then
+    echo "WARN: app-server version record exists but the pid and port records are missing (incomplete state)"
+  fi
+  # alive-confirmed with no port record but a version record present: the
+  # monitor writes pid, then port, then version, in that order — a version
+  # record already existing refutes "still starting up", so this leftover is
+  # genuinely incomplete. Without the version record the same shape is an
+  # ordinary startup race (pid written, port banner not yet parsed) and stays
+  # silent below.
+  if [ "$pid_state" = "alive-confirmed" ] && [ "$ep_state" = "none" ] && [ "$have_verf" -eq 1 ]; then
+    echo "WARN: app-server pid $pid_raw is alive but the port record is missing while a version record exists (incomplete state — not a startup race)"
+  fi
   if [ "$ep_state" = "invalid" ]; then
     echo "WARN: stale app-server endpoint record (invalid port '$port_raw')"
   fi
@@ -255,8 +274,11 @@ _codex_doctor_eval_appserver() {
     fi
   fi
   # Deliberately silent: alive-unverified (ownership genuinely unknown),
-  # unknown-record / unknown-current (cannot tell), and the no-record state
-  # (a monitor-mode project that never launched is normal).
+  # unknown-record / unknown-current (cannot tell), the no-record state
+  # (a monitor-mode project that never launched is normal), and
+  # alive-confirmed with neither a port nor a version record (the monitor
+  # writes the pid before the port banner arrives, so that shape is an
+  # ordinary startup race).
   return 0
 }
 
