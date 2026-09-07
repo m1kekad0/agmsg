@@ -433,12 +433,34 @@ agmsg_doctor_extra_global() {
   local type="$1"
   [ "$type" = "codex" ] || return 0
   _codex_doctor_known_hashes
-  local pidf hash short
-  for pidf in "$RUN_DIR"/codex-app-server.*.pid; do
-    [ -f "$pidf" ] || continue
-    hash="${pidf##*/codex-app-server.}"
-    hash="${hash%.pid}"
-    case "$hash" in ''|*/*) continue ;; esac
+  # Hashes from every record kind, not just pidfiles: the monitor writes the
+  # pid record first and every cleanup path removes pid/port/version
+  # together, so a port/version record without a pid is never a normal
+  # steady state — only a crash between writes or a partial manual cleanup
+  # leaves one behind (humans do hand-edit these files when recovering from
+  # a wedged Codex). The shared evaluator already reports that shape as an
+  # incomplete state with a warning; it only needs enumerating here. The
+  # .log sibling is deliberately excluded: the version-mismatch recreation
+  # path keeps the log while replacing the triple, so a log-only leftover is
+  # routine rotation, not evidence.
+  # Bridge sidecars (.appserver/.thread) without a pidfile are likewise NOT
+  # enumerated: codex-bridge.js removes pidfile+meta on every normal exit
+  # while the launcher-owned sidecars wait to be overwritten, so that shape
+  # is the ordinary post-TUI-close state — reporting it would warn on every
+  # cleanly closed session with no actionable signal behind it.
+  local recf base hash short seen_hashes=""
+  for recf in "$RUN_DIR"/codex-app-server.*.pid \
+             "$RUN_DIR"/codex-app-server.*.port \
+             "$RUN_DIR"/codex-app-server.*.version; do
+    [ -f "$recf" ] || continue
+    base="${recf##*/}"
+    hash="${base#codex-app-server.}"
+    hash="${hash%.*}"
+    case "$hash" in ''|*/*|*.*) continue ;; esac
+    case $'\n'"$seen_hashes"$'\n' in
+      *$'\n'"$hash"$'\n'*) continue ;;
+    esac
+    seen_hashes="${seen_hashes}${hash}"$'\n'
     _codex_doctor_hash_known "$hash" && continue
     short="$hash"
     if [ "${#short}" -gt 12 ]; then short="${short:0:12}…"; fi

@@ -301,8 +301,7 @@ write_bridge_meta() { # $1=key $2=pid $3=project
   [ "$_count" -eq 1 ]
 }
 
-@test "doctor codex: --redacted masks team, agent, and project in the new lines" {
-  local _home_proj="$HOME/redact-codex"
+@test "doctor codex: --redacted masks team, agent, and project in the new lines" {  local _home_proj="$HOME/redact-codex"
   mkdir -p "$_home_proj"
   bash "$SCRIPTS/join.sh" team alice codex "$_home_proj" >/dev/null
   local _dead
@@ -317,4 +316,57 @@ write_bridge_meta() { # $1=key $2=pid $3=project
   [[ "$output" != *"team.alice"* ]]
   # The home-relative project reads as ~/..., never as the raw $HOME path.
   [[ "$output" != *"$HOME"* ]]
+}
+
+@test "doctor codex: zero registrations plus leftover records still surface globally when unfiltered" {
+  # The orphan case: the registration is gone but the run/ records remain.
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  local _dead
+  _dead="$(dead_pid)"
+  local _uh="abcdef0123456789abcdef0123456789abcdef01"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$_dead" > "$TEST_SKILL_DIR/run/codex-app-server.$_uh.pid"
+  printf '%s\n' "64325" > "$TEST_SKILL_DIR/run/codex-app-server.$_uh.port"
+  printf '%s\n' "codex-cli 0.145.0" > "$TEST_SKILL_DIR/run/codex-app-server.$_uh.version"
+
+  run bash "$SCRIPTS/doctor.sh"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"0 team(s), 0 registration(s),"* ]]
+  [[ "$output" == *"matches no registered project (unknown — not attributed)"* ]]
+  [[ "$output" == *"stale app-server pidfile (pid $_dead not running)"* ]]
+  [[ "$output" == *"app-server endpoint is unresponsive (ws://127.0.0.1:64325)"* ]]
+}
+
+@test "doctor codex: port/version records without a pid are an incomplete state, not invisible" {
+  # No pidfile at all — only a crash between writes or a partial manual
+  # cleanup leaves this shape, so it warns instead of staying silent.
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  local _uh="9999888877776666555544443333222211110000"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "64326" > "$TEST_SKILL_DIR/run/codex-app-server.$_uh.port"
+  printf '%s\n' "codex-cli 9.9.9-test" > "$TEST_SKILL_DIR/run/codex-app-server.$_uh.version"
+
+  run bash "$SCRIPTS/doctor.sh"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"matches no registered project (unknown — not attributed)"* ]]
+  [[ "$output" == *"app-server endpoint record exists but the pid record is missing (incomplete state)"* ]]
+  # The leftover files are evidence, not trash for the doctor to take out.
+  [ -f "$TEST_SKILL_DIR/run/codex-app-server.$_uh.port" ]
+  [ -f "$TEST_SKILL_DIR/run/codex-app-server.$_uh.version" ]
+}
+
+@test "doctor codex: --type codex with zero registrations keeps the exit 2 contract" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  local _dead
+  _dead="$(dead_pid)"
+  local _uh="abcdef0123456789abcdef0123456789abcdef01"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$_dead" > "$TEST_SKILL_DIR/run/codex-app-server.$_uh.pid"
+
+  # An explicit type filter that matches nothing is a usage error, even when
+  # orphan records exist — the unfiltered whole-install scan above is their
+  # surface, not a filter that names something absent.
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"no registrations match this scope"* ]]
 }
