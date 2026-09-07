@@ -34,6 +34,12 @@ set -euo pipefail
 # duplicated agmsg_instance_alive once and that duplication was exactly
 # what review pushed back on.
 #
+# Type-specific extras live in scripts/drivers/types/<type>/_doctor.sh when
+# present (codex app-server / bridge-binding state, #5). The per-pair and
+# global hook protocol is documented at the call sites below; plugs are
+# read-only by contract and reuse the helpers above instead of recomputing
+# verdicts.
+#
 # Exit codes:
 #   0  no warnings
 #   1  one or more warnings (see WARNINGS section)
@@ -537,6 +543,42 @@ _doctor_scan_pair() {
     _warn "[$_REDACT_OUT] watcher/bridge pidfile present but process not running (see delivery status above)"
   fi
 
+  # Type-specific extra diagnosis. A plug at
+  # scripts/drivers/types/<type>/_doctor.sh may define
+  # agmsg_doctor_extra_status <type> <project>: its stdout is quoted into this
+  # pair's block (redacted below together with everything else), except lines
+  # starting with "WARN: ", which become warnings instead (prefix stripped,
+  # project-prefixed like every other warning here). Only codex ships such a
+  # plug today (app-server pid/port/version + bridge binding state, #5);
+  # every other type skips this with one file-exists check. Sourced, not
+  # shelled out, so the plug reuses this script's own helpers (liveness,
+  # cmdline, redaction tables) instead of recomputing them; the plug's own
+  # double-source guard makes re-sourcing once per pair a no-op after the
+  # first. Read-only by contract: a plug never kills, removes, or restarts
+  # anything — stale or foreign state is reported, not cleaned up.
+  _extra_plug="$SKILL_DIR/scripts/drivers/types/$type/_doctor.sh"
+  if [ -f "$_extra_plug" ]; then
+    # shellcheck disable=SC1091
+    . "$_extra_plug" 2>/dev/null || true
+    if command -v agmsg_doctor_extra_status >/dev/null 2>&1; then
+      _extra_output="$(agmsg_doctor_extra_status "$type" "$project" 2>/dev/null || true)"
+      _extra_warns="$(printf '%s\n' "$_extra_output" | grep '^WARN: ' | sed 's/^WARN: //' || true)"
+      if [ -n "$_extra_warns" ]; then
+        while IFS= read -r _extra_warn; do
+          [ -n "$_extra_warn" ] || continue
+          _extra_warn_red="$(_redact_text "$_extra_warn" "$project")"
+          _redact_project "$project"
+          _warn "[$_REDACT_OUT] $_extra_warn_red"
+        done <<< "$_extra_warns" || true
+      fi
+      _extra_display="$(printf '%s\n' "$_extra_output" | grep -v '^WARN: ' || true)"
+      if [ -n "$_extra_display" ]; then
+        delivery_output="${delivery_output}${delivery_output:+$'\n'}${_extra_display}"
+      fi
+    fi
+  fi
+  unset _extra_plug _extra_output _extra_warns _extra_warn _extra_warn_red _extra_display
+
   # type is already validated (or came from the registry) before this is
   # ever called, so this is not the "unknown type" case -- some other
   # failure inside delivery.sh status itself. Surfaced as a warning rather
@@ -623,9 +665,14 @@ _doctor_scan_pair() {
 # the exact identities.sh call _doctor_scan_pair already makes for the same
 # pair, instead of querying it twice.
 DISTINCT_TEAMS=""
+SCANNED_TYPES=""
 while IFS=$'\t' read -r _proj _type; do
   [ -z "$_proj" ] && continue
   _doctor_scan_pair "$_proj" "$_type"
+  case $'\n'"$SCANNED_TYPES"$'\n' in
+    *$'\n'"$_type"$'\n'*) ;;
+    *) SCANNED_TYPES="${SCANNED_TYPES}${_type}"$'\n' ;;
+  esac
   while IFS=$'\t' read -r _team _agent; do
     [ -z "$_team" ] && continue
     case $'\n'"$DISTINCT_TEAMS"$'\n' in
@@ -648,12 +695,72 @@ if [ -n "$GLOBAL_WATCH_LINE" ]; then
     _warn "watcher pidfile present but process not running, installation-wide (see the 'watch processes' line above)"
   fi
 fi
+
+# Installation-wide type-plug diagnosis, once per run rather than per pair:
+# records no pair owns (a codex app-server triple whose hash matches no
+# registered project, launcher-generation bridge bindings no per-pair call
+# attributed). Same plug protocol as the per-pair hook above, minus the
+# project: agmsg_doctor_extra_global <type> prints display lines and "WARN: "
+# lines, which here carry their own record identifier instead of a project
+# prefix. Displayed with the other installation-wide state above the
+# per-pair blocks.
+#
+# Scope rule: an explicit --project never reports out-of-scope installation
+# state, and an explicit --type/--team keeps the report to what was asked
+# for — both skip plugs their scope did not scan. But a completely
+# unfiltered whole-install scan runs EVERY available plug, not just the
+# scanned types': a type with zero registrations has no pair to scan, so a
+# scanned-types-only rule would blind the report exactly when leftover state
+# (records from removed or never-registered projects) needs it most (#5's
+# orphan case). --type <t> with zero registrations keeps its existing exit 2
+# (decided before any scanning happens), unchanged by this.
+GLOBAL_EXTRA_BLOCKS=""
+GLOBAL_PLUG_TYPES="$SCANNED_TYPES"
+if [ -z "$FILTER_PROJECT" ] && [ -z "$FILTER_TYPE" ] && [ -z "$FILTER_TEAM" ]; then
+  for _plug_path in "$SKILL_DIR/scripts/drivers/types/"*/_doctor.sh; do
+    [ -f "$_plug_path" ] || continue
+    _plug_type="$(basename "$(dirname "$_plug_path")")"
+    case $'\n'"$GLOBAL_PLUG_TYPES"$'\n' in
+      *$'\n'"$_plug_type"$'\n'*) ;;
+      *) GLOBAL_PLUG_TYPES="${GLOBAL_PLUG_TYPES}${_plug_type}"$'\n' ;;
+    esac
+  done
+fi
+if [ -z "$FILTER_PROJECT" ]; then
+  while IFS= read -r _extra_type; do
+    [ -n "$_extra_type" ] || continue
+    _extra_plug="$SKILL_DIR/scripts/drivers/types/$_extra_type/_doctor.sh"
+    [ -f "$_extra_plug" ] || continue
+    # shellcheck disable=SC1091
+    . "$_extra_plug" 2>/dev/null || true
+    if command -v agmsg_doctor_extra_global >/dev/null 2>&1; then
+      _extra_output="$(agmsg_doctor_extra_global "$_extra_type" 2>/dev/null || true)"
+      _extra_warns="$(printf '%s\n' "$_extra_output" | grep '^WARN: ' | sed 's/^WARN: //' || true)"
+      if [ -n "$_extra_warns" ]; then
+        while IFS= read -r _extra_warn; do
+          [ -n "$_extra_warn" ] || continue
+          _warn "$(_redact_text "$_extra_warn" "")"
+        done <<< "$_extra_warns" || true
+      fi
+      _extra_display="$(printf '%s\n' "$_extra_output" | grep -v '^WARN: ' || true)"
+      if [ -n "$_extra_display" ]; then
+        GLOBAL_EXTRA_BLOCKS="${GLOBAL_EXTRA_BLOCKS}$(_redact_text "$_extra_display" "")"$'\n'
+      fi
+    fi
+  done <<< "$GLOBAL_PLUG_TYPES" || true
+fi
+unset _extra_type _extra_plug _extra_output _extra_warns _extra_warn _extra_display
+unset _plug_path _plug_type GLOBAL_PLUG_TYPES
 WARN_COUNT="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
 
 echo "$TEAM_COUNT team(s), $TOTAL_PAIR_COUNT registration(s), $WARN_COUNT warning(s)"
 echo
 if [ -n "$GLOBAL_WATCH_LINE" ]; then
   echo "$GLOBAL_WATCH_LINE"
+  echo
+fi
+if [ -n "$GLOBAL_EXTRA_BLOCKS" ]; then
+  printf '%s' "$GLOBAL_EXTRA_BLOCKS"
   echo
 fi
 printf '%s' "$REPORT_BLOCKS"
