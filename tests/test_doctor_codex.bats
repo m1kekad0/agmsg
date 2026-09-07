@@ -301,7 +301,8 @@ write_bridge_meta() { # $1=key $2=pid $3=project
   [ "$_count" -eq 1 ]
 }
 
-@test "doctor codex: --redacted masks team, agent, and project in the new lines" {  local _home_proj="$HOME/redact-codex"
+@test "doctor codex: --redacted masks team, agent, and project in the new lines" {
+  local _home_proj="$HOME/redact-codex"
   mkdir -p "$_home_proj"
   bash "$SCRIPTS/join.sh" team alice codex "$_home_proj" >/dev/null
   local _dead
@@ -369,4 +370,51 @@ write_bridge_meta() { # $1=key $2=pid $3=project
   run bash "$SCRIPTS/doctor.sh" --type codex
   [ "$status" -eq 2 ]
   [[ "$output" == *"no registrations match this scope"* ]]
+}
+
+@test "doctor codex: version record alone, without pid and port, is incomplete" {
+  # pid and port records are managed as a set with the version record, so a
+  # version-only leftover is evidence of an incomplete state — warned about,
+  # never silently clean.
+  local _h
+  _h="$(proj_hash "$PROJ")"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "codex-cli 9.9.9-test" > "$TEST_SKILL_DIR/run/codex-app-server.$_h.version"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"version record exists but the pid and port records are missing (incomplete state)"* ]]
+  [ -f "$TEST_SKILL_DIR/run/codex-app-server.$_h.version" ]
+}
+
+@test "doctor codex: alive pid without a port record warns only when a version record rules out startup" {
+  local _pid
+  _pid="$(confirmed_pid)"
+  local _h
+  _h="$(proj_hash "$PROJ")"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$_pid" > "$TEST_SKILL_DIR/run/codex-app-server.$_h.pid"
+  # No port record. A version record already existing refutes "still starting
+  # up" (the monitor writes pid, then port, then version), so this warns.
+  printf '%s\n' "codex-cli 9.9.9-test" > "$TEST_SKILL_DIR/run/codex-app-server.$_h.version"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"is alive but the port record is missing while a version record exists (incomplete state"* ]]
+  kill -0 "$_pid"
+}
+
+@test "doctor codex: alive pid with neither port nor version record stays silent (startup race)" {
+  local _pid
+  _pid="$(confirmed_pid)"
+  local _h
+  _h="$(proj_hash "$PROJ")"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$_pid" > "$TEST_SKILL_DIR/run/codex-app-server.$_h.pid"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no port record"* ]]
+  [[ "$output" == *"no warnings."* ]]
+  kill -0 "$_pid"
 }
