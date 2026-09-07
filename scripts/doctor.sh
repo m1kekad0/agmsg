@@ -702,10 +702,30 @@ fi
 # attributed). Same plug protocol as the per-pair hook above, minus the
 # project: agmsg_doctor_extra_global <type> prints display lines and "WARN: "
 # lines, which here carry their own record identifier instead of a project
-# prefix. Skipped under --project — an explicit project scope must not report
-# out-of-scope installation state. Displayed with the other installation-wide
-# state above the per-pair blocks.
+# prefix. Displayed with the other installation-wide state above the
+# per-pair blocks.
+#
+# Scope rule: an explicit --project never reports out-of-scope installation
+# state, and an explicit --type/--team keeps the report to what was asked
+# for — both skip plugs their scope did not scan. But a completely
+# unfiltered whole-install scan runs EVERY available plug, not just the
+# scanned types': a type with zero registrations has no pair to scan, so a
+# scanned-types-only rule would blind the report exactly when leftover state
+# (records from removed or never-registered projects) needs it most (#5's
+# orphan case). --type <t> with zero registrations keeps its existing exit 2
+# (decided before any scanning happens), unchanged by this.
 GLOBAL_EXTRA_BLOCKS=""
+GLOBAL_PLUG_TYPES="$SCANNED_TYPES"
+if [ -z "$FILTER_PROJECT" ] && [ -z "$FILTER_TYPE" ] && [ -z "$FILTER_TEAM" ]; then
+  for _plug_path in "$SKILL_DIR/scripts/drivers/types/"*/_doctor.sh; do
+    [ -f "$_plug_path" ] || continue
+    _plug_type="$(basename "$(dirname "$_plug_path")")"
+    case $'\n'"$GLOBAL_PLUG_TYPES"$'\n' in
+      *$'\n'"$_plug_type"$'\n'*) ;;
+      *) GLOBAL_PLUG_TYPES="${GLOBAL_PLUG_TYPES}${_plug_type}"$'\n' ;;
+    esac
+  done
+fi
 if [ -z "$FILTER_PROJECT" ]; then
   while IFS= read -r _extra_type; do
     [ -n "$_extra_type" ] || continue
@@ -727,9 +747,10 @@ if [ -z "$FILTER_PROJECT" ]; then
         GLOBAL_EXTRA_BLOCKS="${GLOBAL_EXTRA_BLOCKS}$(_redact_text "$_extra_display" "")"$'\n'
       fi
     fi
-  done <<< "$SCANNED_TYPES" || true
+  done <<< "$GLOBAL_PLUG_TYPES" || true
 fi
 unset _extra_type _extra_plug _extra_output _extra_warns _extra_warn _extra_display
+unset _plug_path _plug_type GLOBAL_PLUG_TYPES
 WARN_COUNT="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
 
 echo "$TEAM_COUNT team(s), $TOTAL_PAIR_COUNT registration(s), $WARN_COUNT warning(s)"
