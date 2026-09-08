@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # codex doctor plug — read-only app-server / bridge-binding diagnosis.
 #
-# Sourced by doctor.sh (never executed directly). Defines the two protocol
-# entry points doctor.sh calls when this file exists:
-#   agmsg_doctor_extra_status <type> <project>   per-(project, codex) records
-#   agmsg_doctor_extra_global <type>             installation-wide leftovers
+# Sourced by doctor.sh (never executed directly). Defines the structured
+# collector entry points doctor.sh calls when this file exists:
+#   agmsg_doctor_extra_collect <type> <project>   per-(project, codex) records
+#   agmsg_doctor_extra_global_collect <type>      installation-wide leftovers
 #
-# Protocol: stdout is display lines quoted into the report; lines starting
-# with "WARN: " become doctor warnings instead (the prefix is stripped).
+# The collectors register findings / component signals / display lines
+# directly through doctor.sh's collector API (Issue #8) -- the human WARN
+# lines and the --json findings are both rendered from that one store, so
+# the two outputs share a single judgment. Nothing here prints a "WARN: "
+# line for doctor.sh to parse back; the legacy agmsg_doctor_extra_status /
+# agmsg_doctor_extra_global entry points remain as thin wrappers that run
+# the same collectors into a scratch store and render the old text protocol
+# for any external caller still on it.
 #
 # Read-only by contract (Issue #5 Phase 1): this file never kills a process
 # and never creates, removes, or rewrites any record. A dead pid, a foreign
@@ -40,13 +46,47 @@ if ! command -v agmsg_role_session_load >/dev/null 2>&1; then
   . "$SKILL_DIR/scripts/lib/role-session.sh"
 fi
 
+# Scope context for one collector run, set by the entry points below. The
+# shared evaluators read these instead of taking scope arguments, so the
+# per-pair and global paths cannot diverge in what they record.
+_CODEX_DOCTOR_SCOPE_PROJECT=""
+_CODEX_DOCTOR_SCOPE_TYPE=""
+_CODEX_DOCTOR_DISPLAY_MODE="pair"
+
+# One structured warning. $1 is the stable finding code (kind is always
+# condition here; category runtime); $2/$3/$4 are the component target
+# (team/agent empty for the scope-singleton app-server). Evidence wording is
+# unchanged from the legacy WARN text -- human output stays byte-identical.
+_codex_doctor_warn() {
+  agmsg_doctor_finding_add "$1" condition runtime \
+    "$_CODEX_DOCTOR_SCOPE_PROJECT" "$_CODEX_DOCTOR_SCOPE_TYPE" \
+    component "$2" "$3" "$4" "$5"
+}
+
+# One component observation signal.
+_codex_doctor_signal() {
+  agmsg_doctor_component_signal \
+    "$_CODEX_DOCTOR_SCOPE_PROJECT" "$_CODEX_DOCTOR_SCOPE_TYPE" \
+    "$1" "$2" "$3" "$4" "$5"
+}
+
+# One human display line for the pair's block (pair mode) or the
+# installation-wide block (global mode).
+_codex_doctor_display() {
+  if [ "$_CODEX_DOCTOR_DISPLAY_MODE" = "global" ]; then
+    agmsg_doctor_global_display_add "$_CODEX_DOCTOR_SCOPE_TYPE" "$1"
+  else
+    agmsg_doctor_display_add "$_CODEX_DOCTOR_SCOPE_PROJECT" "$_CODEX_DOCTOR_SCOPE_TYPE" "$1"
+  fi
+}
+
 # Best-effort memo for the current `codex --version` answer. NOTE on scope:
-# doctor.sh invokes both entry points below inside command substitutions, so
-# anything assigned here never travels back to the parent shell — the memo
-# only dedupes probes WITHIN one entry-point call (e.g. several unattributed
-# hashes in one global scan), and each per-pair call probes once. That is
-# accepted as is: one `codex --version` per codex pair is cheap, and hoisting
-# the probe into the parent is deliberately not done (no optimization).
+# doctor.sh calls the collectors below directly in its own shell, but the
+# version probe assignments here only dedupe probes WITHIN one entry-point
+# call (e.g. several unattributed hashes in one global scan) — each per-pair
+# call probes once. That is accepted as is: one `codex --version` per codex
+# pair is cheap, and hoisting the probe into the parent is deliberately not
+# done (no optimization).
 _AGMSG_CODEX_DOCTOR_VERSION_PROBED=""
 _AGMSG_CODEX_DOCTOR_VERSION=""
 _CODEX_DOCTOR_KNOWN_HASHES=""
@@ -125,7 +165,8 @@ _codex_doctor_hash_known() {
 # Evaluate one app-server record triple by project hash. $2 is 1 when the hash
 # is attributed to a known project (per-pair call: relaunch advice applies)
 # and 0 when it is not (global call: unknown/ambiguous framing, no advice
-# that names a project). Prints display lines and WARN: lines.
+# that names a project). Registers display lines and structured findings
+# through the collector helpers above.
 _codex_doctor_eval_appserver() {
   local hash="$1" attributed="$2"
   local pidf="$RUN_DIR/codex-app-server.$hash.pid"
@@ -138,7 +179,7 @@ _codex_doctor_eval_appserver() {
 
   if [ "$have_pidf" -eq 0 ] && [ "$have_portf" -eq 0 ] && [ "$have_verf" -eq 0 ]; then
     if [ "$attributed" -eq 1 ]; then
-      echo "Codex app-server: no record for this project (never launched, or cleaned)"
+      _codex_doctor_display "Codex app-server: no record for this project (never launched, or cleaned)"
     fi
     return 0
   fi
@@ -202,41 +243,48 @@ _codex_doctor_eval_appserver() {
 
   # --- display: one line per signal, each stating its own evidence.
   case "$pid_state" in
-    none) echo "Codex app-server: no pid record" ;;
-    invalid) echo "Codex app-server: pid record invalid ('$pid_raw')" ;;
-    dead) echo "Codex app-server: pid $pid_raw not running" ;;
-    alive-confirmed) echo "Codex app-server: pid $pid_raw alive (Codex app-server cmdline confirmed)" ;;
-    alive-unverified) echo "Codex app-server: pid $pid_raw alive (cmdline unreadable — ownership unverified)" ;;
-    alive-foreign) echo "Codex app-server: pid $pid_raw alive but is not a Codex app-server (possible pid reuse)" ;;
+    none) _codex_doctor_display "Codex app-server: no pid record" ;;
+    invalid) _codex_doctor_display "Codex app-server: pid record invalid ('$pid_raw')" ;;
+    dead) _codex_doctor_display "Codex app-server: pid $pid_raw not running" ;;
+    alive-confirmed) _codex_doctor_display "Codex app-server: pid $pid_raw alive (Codex app-server cmdline confirmed)" ;;
+    alive-unverified) _codex_doctor_display "Codex app-server: pid $pid_raw alive (cmdline unreadable — ownership unverified)" ;;
+    alive-foreign) _codex_doctor_display "Codex app-server: pid $pid_raw alive but is not a Codex app-server (possible pid reuse)" ;;
   esac
   case "$ep_state" in
-    none) echo "Codex app-server endpoint: no port record" ;;
-    invalid) echo "Codex app-server endpoint: port record invalid ('$port_raw')" ;;
-    silent) echo "Codex app-server endpoint: ${url} unresponsive" ;;
-    responsive) echo "Codex app-server endpoint: ${url} answers (listener present — not proof of ownership)" ;;
+    none) _codex_doctor_display "Codex app-server endpoint: no port record" ;;
+    invalid) _codex_doctor_display "Codex app-server endpoint: port record invalid ('$port_raw')" ;;
+    silent) _codex_doctor_display "Codex app-server endpoint: ${url} unresponsive" ;;
+    responsive) _codex_doctor_display "Codex app-server endpoint: ${url} answers (listener present — not proof of ownership)" ;;
   esac
   case "$ver_state" in
-    unknown-record) echo "Codex app-server version: no version record (recreated on next monitor launch)" ;;
-    unknown-current) echo "Codex app-server version: recorded '$ver_raw' (current version unreadable — check skipped)" ;;
-    match) echo "Codex app-server version: '$ver_raw' (matches current)" ;;
-    drift) echo "Codex app-server version: recorded '$ver_raw', current '$cur' (drift)" ;;
+    unknown-record) _codex_doctor_display "Codex app-server version: no version record (recreated on next monitor launch)" ;;
+    unknown-current) _codex_doctor_display "Codex app-server version: recorded '$ver_raw' (current version unreadable — check skipped)" ;;
+    match) _codex_doctor_display "Codex app-server version: '$ver_raw' (matches current)" ;;
+    drift) _codex_doctor_display "Codex app-server version: recorded '$ver_raw', current '$cur' (drift)" ;;
   esac
   if [ "$pid_state" = "alive-confirmed" ] && [ "$ep_state" = "responsive" ] && [ "$ver_state" = "match" ]; then
-    echo "Codex app-server: healthy (pid $pid_raw, $url, version '$ver_raw')"
+    _codex_doctor_display "Codex app-server: healthy (pid $pid_raw, $url, version '$ver_raw')"
   fi
+
+  # --- component signals: the same three verdicts as observations (a record
+  # triple exists -- the no-record early return above stayed silent). No
+  # health verdict: attention states are findings below, not signal values.
+  _codex_doctor_signal codex_app_server "" "" process "$pid_state"
+  _codex_doctor_signal codex_app_server "" "" endpoint "$ep_state"
+  _codex_doctor_signal codex_app_server "" "" version "$ver_state"
 
   # --- warnings: one independent rule per signal. Combined states surface as
   # several warnings, never as a single verdict that needs all of them.
   case "$pid_state" in
-    invalid) echo "WARN: stale app-server pid record (invalid pid '$pid_raw')" ;;
-    dead) echo "WARN: stale app-server pidfile (pid $pid_raw not running)" ;;
-    alive-foreign) echo "WARN: app-server pid $pid_raw is alive but is not a Codex app-server (possible pid reuse); the record does not point at a live server" ;;
+    invalid) _codex_doctor_warn codex_pid_invalid "" "" codex_app_server "stale app-server pid record (invalid pid '$pid_raw')" ;;
+    dead) _codex_doctor_warn codex_pid_stale "" "" codex_app_server "stale app-server pidfile (pid $pid_raw not running)" ;;
+    alive-foreign) _codex_doctor_warn codex_pid_foreign "" "" codex_app_server "app-server pid $pid_raw is alive but is not a Codex app-server (possible pid reuse); the record does not point at a live server" ;;
   esac
   if [ "$pid_state" = "none" ] && [ "$have_portf" -eq 1 ]; then
-    echo "WARN: app-server endpoint record exists but the pid record is missing (incomplete state)"
+    _codex_doctor_warn codex_records_incomplete "" "" codex_app_server "app-server endpoint record exists but the pid record is missing (incomplete state)"
   fi
   if [ "$pid_state" = "none" ] && [ "$have_portf" -eq 0 ] && [ "$have_verf" -eq 1 ]; then
-    echo "WARN: app-server version record exists but the pid and port records are missing (incomplete state)"
+    _codex_doctor_warn codex_records_incomplete "" "" codex_app_server "app-server version record exists but the pid and port records are missing (incomplete state)"
   fi
   # alive-confirmed with no port record but a version record present: the
   # monitor writes pid, then port, then version, in that order — a version
@@ -245,32 +293,32 @@ _codex_doctor_eval_appserver() {
   # ordinary startup race (pid written, port banner not yet parsed) and stays
   # silent below.
   if [ "$pid_state" = "alive-confirmed" ] && [ "$ep_state" = "none" ] && [ "$have_verf" -eq 1 ]; then
-    echo "WARN: app-server pid $pid_raw is alive but the port record is missing while a version record exists (incomplete state — not a startup race)"
+    _codex_doctor_warn codex_records_incomplete "" "" codex_app_server "app-server pid $pid_raw is alive but the port record is missing while a version record exists (incomplete state — not a startup race)"
   fi
   if [ "$ep_state" = "invalid" ]; then
-    echo "WARN: stale app-server endpoint record (invalid port '$port_raw')"
+    _codex_doctor_warn codex_endpoint_invalid "" "" codex_app_server "stale app-server endpoint record (invalid port '$port_raw')"
   fi
   if [ "$ep_state" = "silent" ] && [ "$pid_state" = "alive-confirmed" ]; then
-    echo "WARN: app-server process is alive (pid $pid_raw) but its endpoint is unresponsive ($url)"
+    _codex_doctor_warn codex_endpoint_unresponsive "" "" codex_app_server "app-server process is alive (pid $pid_raw) but its endpoint is unresponsive ($url)"
   fi
   if [ "$ep_state" = "silent" ] && [ "$pid_state" != "alive-confirmed" ] && [ "$pid_state" != "alive-unverified" ]; then
-    echo "WARN: app-server endpoint is unresponsive ($url)"
+    _codex_doctor_warn codex_endpoint_unresponsive "" "" codex_app_server "app-server endpoint is unresponsive ($url)"
   fi
   if [ "$ep_state" = "responsive" ]; then
     case "$pid_state" in
       dead|none|invalid)
-        echo "WARN: endpoint $url answers but no live recorded server owns it (another process may hold the port)"
+        _codex_doctor_warn codex_endpoint_foreign "" "" codex_app_server "endpoint $url answers but no live recorded server owns it (another process may hold the port)"
         ;;
       alive-foreign)
-        echo "WARN: endpoint $url answers but the recorded pid $pid_raw is not a Codex app-server (ownership unproven)"
+        _codex_doctor_warn codex_endpoint_foreign "" "" codex_app_server "endpoint $url answers but the recorded pid $pid_raw is not a Codex app-server (ownership unproven)"
         ;;
     esac
   fi
   if [ "$ver_state" = "drift" ]; then
     if [ "$attributed" -eq 1 ]; then
-      echo "WARN: app-server version drift (recorded '$ver_raw', current '$cur'); relaunch Codex through the monitor to recreate the server"
+      _codex_doctor_warn codex_version_drift "" "" codex_app_server "app-server version drift (recorded '$ver_raw', current '$cur'); relaunch Codex through the monitor to recreate the server"
     else
-      echo "WARN: app-server version drift (recorded '$ver_raw', current '$cur'; owning project unknown)"
+      _codex_doctor_warn codex_version_drift "" "" codex_app_server "app-server version drift (recorded '$ver_raw', current '$cur'; owning project unknown)"
     fi
   fi
   # Deliberately silent: alive-unverified (ownership genuinely unknown),
@@ -346,26 +394,48 @@ _codex_doctor_eval_binding() {
 
   local run_word="not running"
   if [ "$alive" -eq 1 ]; then run_word="alive (pid $bridge_pid)"; fi
-  echo "Codex bridge binding: $key $run_word, app-server=$url_verdict, thread=$thread_verdict"
+  _codex_doctor_display "Codex bridge binding: $key $run_word, app-server=$url_verdict, thread=$thread_verdict"
   if [ -n "$bound_url" ] && [ "$url_verdict" != "unknown" ]; then
-    echo "  bound app-server: $bound_url"
+    _codex_doctor_display "  bound app-server: $bound_url"
   fi
+
+  # Session-like identifiers travel in evidence -- register them so
+  # --redacted masks them everywhere the shared tables run.
+  [ -n "$bound_thread" ] && agmsg_doctor_note_secret "$bound_thread"
+  [ -n "$seat" ] && [ "$seat" != "$bound_thread" ] && agmsg_doctor_note_secret "$seat"
+
+  # Component observations for this launcher-generation bridge: liveness,
+  # the bound app-server URL against the project's current endpoint, and
+  # the bound thread against the role's recorded seat.
+  local _proc_sig="not-running" _bind_sig="unknown" _seat_sig="unknown"
+  if [ "$alive" -eq 1 ]; then _proc_sig="running"; fi
+  case "$url_verdict" in
+    match) _bind_sig="matched" ;;
+    mismatch) _bind_sig="mismatched" ;;
+  esac
+  case "$thread_verdict" in
+    match) _seat_sig="matched" ;;
+    mismatch) _seat_sig="mismatched" ;;
+  esac
+  _codex_doctor_signal codex_bridge "$team" "$name" process "$_proc_sig"
+  _codex_doctor_signal codex_bridge "$team" "$name" binding "$_bind_sig"
+  _codex_doctor_signal codex_bridge "$team" "$name" seat "$_seat_sig"
 
   if [ "$alive" -eq 0 ]; then
     if [ -f "$RUN_DIR/codex-bridge.$key.pid" ]; then
-      echo "WARN: stale bridge pidfile ($key, pid '${bridge_pid:-empty}' not running)"
+      _codex_doctor_warn codex_bridge_stale_pidfile "$team" "$name" codex_bridge "stale bridge pidfile ($key, pid '${bridge_pid:-empty}' not running)"
     fi
     return 0
   fi
   if [ "$url_verdict" = "mismatch" ]; then
     if [ -n "$current_url" ]; then
-      echo "WARN: bridge $key is bound to a stale app-server (bound '$bound_url', current '$current_url')"
+      _codex_doctor_warn codex_bridge_stale_binding "$team" "$name" codex_bridge "bridge $key is bound to a stale app-server (bound '$bound_url', current '$current_url')"
     else
-      echo "WARN: bridge $key is alive but this project has no current app-server endpoint (bound '$bound_url')"
+      _codex_doctor_warn codex_bridge_stale_binding "$team" "$name" codex_bridge "bridge $key is alive but this project has no current app-server endpoint (bound '$bound_url')"
     fi
   fi
   if [ "$thread_verdict" = "mismatch" ]; then
-    echo "WARN: bridge $key is bound to thread '$bound_thread' but the recorded seat is '$seat'"
+    _codex_doctor_warn codex_bridge_thread_mismatch "$team" "$name" codex_bridge "bridge $key is bound to thread '$bound_thread' but the recorded seat is '$seat'"
   fi
   return 0
 }
@@ -373,8 +443,7 @@ _codex_doctor_eval_binding() {
 # Union of every registered codex (team, agent) pair, one "team<TAB>name"
 # line each. The per-pair call attributes single-role bridge keys against its
 # own project's pairs, so the global scan skips whatever this union holds —
-# no cross-call state needed (doctor.sh invokes both entry points inside
-# command substitutions, where assignments would be lost with the subshell).
+# recomputed per call instead of shared as cross-call state.
 _codex_doctor_registered_pairs() {
   local proj pair_lines=""
   while IFS= read -r proj; do
@@ -412,6 +481,7 @@ _codex_doctor_global_bindings() {
     bridge_pid="$(_codex_doctor_read_record "$pidf")"
     bound_url="$(_codex_doctor_read_record "$RUN_DIR/codex-bridge.$key.appserver")"
     bound_thread="$(_codex_doctor_read_record "$RUN_DIR/codex-bridge.$key.thread")"
+    [ -n "$bound_thread" ] && agmsg_doctor_note_secret "$bound_thread"
     if [ -n "$bridge_pid" ] && _agmsg_pid_valid "$bridge_pid" 2>/dev/null \
       && _agmsg_pid_alive "$bridge_pid" 2>/dev/null; then
       bound_port=""
@@ -420,28 +490,48 @@ _codex_doctor_global_bindings() {
       esac
       if [ -n "$bound_port" ] && _codex_doctor_valid_port "$bound_port" \
         && ! _codex_doctor_port_alive "$bound_port"; then
-        echo "Codex bridge binding: $key alive (pid $bridge_pid), bound endpoint $bound_url unresponsive"
-        echo "WARN: bridge $key is alive but its bound endpoint is unresponsive ($bound_url)"
+        _codex_doctor_display "Codex bridge binding: $key alive (pid $bridge_pid), bound endpoint $bound_url unresponsive"
+        _codex_doctor_warn codex_bridge_endpoint_unresponsive "" "" codex_bridge "bridge $key is alive but its bound endpoint is unresponsive ($bound_url)"
+        _codex_doctor_signal codex_bridge "" "" process "running"
+        _codex_doctor_signal codex_bridge "" "" endpoint "unresponsive"
+        _codex_doctor_signal codex_bridge "" "" seat "unknown"
       elif [ -n "$bound_thread" ]; then
         seated="$(agmsg_role_session_recorded_uuids codex 2>/dev/null || true)"
         case $'\n'"$seated"$'\n' in
-          *$'\n'"$bound_thread"$'\n'*) ;;
+          *$'\n'"$bound_thread"$'\n'*)
+            _codex_doctor_signal codex_bridge "" "" process "running"
+            _codex_doctor_signal codex_bridge "" "" endpoint "unknown"
+            _codex_doctor_signal codex_bridge "" "" seat "matched"
+            ;;
           *)
-            echo "Codex bridge binding: $key alive (pid $bridge_pid), bound thread matches no recorded seat (ambiguous — not attributed)"
+            _codex_doctor_display "Codex bridge binding: $key alive (pid $bridge_pid), bound thread matches no recorded seat (ambiguous — not attributed)"
+            _codex_doctor_signal codex_bridge "" "" process "running"
+            _codex_doctor_signal codex_bridge "" "" endpoint "unknown"
+            _codex_doctor_signal codex_bridge "" "" seat "unknown"
             ;;
         esac
+      else
+        _codex_doctor_signal codex_bridge "" "" process "running"
+        _codex_doctor_signal codex_bridge "" "" endpoint "unknown"
+        _codex_doctor_signal codex_bridge "" "" seat "unknown"
       fi
     else
-      echo "Codex bridge binding: $key not running (pid '${bridge_pid:-empty}')"
-      echo "WARN: stale bridge pidfile ($key, pid '${bridge_pid:-empty}' not running)"
+      _codex_doctor_display "Codex bridge binding: $key not running (pid '${bridge_pid:-empty}')"
+      _codex_doctor_warn codex_bridge_stale_pidfile "" "" codex_bridge "stale bridge pidfile ($key, pid '${bridge_pid:-empty}' not running)"
+      _codex_doctor_signal codex_bridge "" "" process "not-running"
+      _codex_doctor_signal codex_bridge "" "" endpoint "unknown"
+      _codex_doctor_signal codex_bridge "" "" seat "unknown"
     fi
   done
   return 0
 }
 
-agmsg_doctor_extra_status() {
+agmsg_doctor_extra_collect() {
   local type="$1" project="$2"
   [ "$type" = "codex" ] || return 0
+  _CODEX_DOCTOR_SCOPE_PROJECT="$project"
+  _CODEX_DOCTOR_SCOPE_TYPE="$type"
+  _CODEX_DOCTOR_DISPLAY_MODE="pair"
   local hash port_raw
   hash="$(printf '%s' "$project" | agmsg_sha1 2>/dev/null || true)"
   [ -n "$hash" ] || return 0
@@ -451,9 +541,12 @@ agmsg_doctor_extra_status() {
   return 0
 }
 
-agmsg_doctor_extra_global() {
+agmsg_doctor_extra_global_collect() {
   local type="$1"
   [ "$type" = "codex" ] || return 0
+  _CODEX_DOCTOR_SCOPE_PROJECT=""
+  _CODEX_DOCTOR_SCOPE_TYPE="$type"
+  _CODEX_DOCTOR_DISPLAY_MODE="global"
   _codex_doctor_known_hashes
   # Hashes from every record kind, not just pidfiles: the monitor writes the
   # pid record first and every cleanup path removes pid/port/version
@@ -486,9 +579,67 @@ agmsg_doctor_extra_global() {
     _codex_doctor_hash_known "$hash" && continue
     short="$hash"
     if [ "${#short}" -gt 12 ]; then short="${short:0:12}…"; fi
-    echo "Codex app-server record '$short' matches no registered project (unknown — not attributed)"
+    _codex_doctor_display "Codex app-server record '$short' matches no registered project (unknown — not attributed)"
     _codex_doctor_eval_appserver "$hash" 0
   done
   _codex_doctor_global_bindings
+  return 0
+}
+
+# Legacy text-protocol wrappers (human compatibility for external callers
+# still on agmsg_doctor_extra_status / agmsg_doctor_extra_global).
+# doctor.sh itself uses the collectors above, never these. Each wrapper runs
+# the matching collector into a scratch store and renders the old shapes
+# (display lines verbatim, findings as "WARN: <evidence>"); judgments stay
+# single-sourced in the shared evaluators.
+_codex_doctor_legacy_render() {
+  local findings_file="$1" display_file="$2" line i
+  local sep
+  sep="$(printf '\037')"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    for ((i = 0; i < 9; i++)); do line="${line#*$sep}"; done
+    printf 'WARN: %s\n' "$line"
+  done < "$findings_file"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    line="${line#*$sep}"; line="${line#*$sep}"
+    [ -n "$line" ] || continue
+    printf '%s\n' "$line"
+  done < "$display_file"
+  return 0
+}
+
+agmsg_doctor_extra_status() {
+  local type="$1" project="$2"
+  [ "$type" = "codex" ] || return 0
+  local _sv_findings="${_DOCTOR_FINDINGS_FILE:-}" _sv_display="${_DOCTOR_DISPLAY_FILE:-}"
+  local _sv_comps="${_DOCTOR_COMPS_FILE:-}" _tmp
+  _tmp="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-codex-doctor.XXXXXX")"
+  _DOCTOR_FINDINGS_FILE="$_tmp/findings.tsv"; : > "$_DOCTOR_FINDINGS_FILE"
+  _DOCTOR_DISPLAY_FILE="$_tmp/display.tsv"; : > "$_DOCTOR_DISPLAY_FILE"
+  _DOCTOR_COMPS_FILE="$_tmp/comps.tsv"; : > "$_DOCTOR_COMPS_FILE"
+  agmsg_doctor_extra_collect "$type" "$project" 2>/dev/null
+  _codex_doctor_legacy_render "$_DOCTOR_FINDINGS_FILE" "$_DOCTOR_DISPLAY_FILE"
+  _DOCTOR_FINDINGS_FILE="$_sv_findings"; _DOCTOR_DISPLAY_FILE="$_sv_display"
+  _DOCTOR_COMPS_FILE="$_sv_comps"
+  rm -rf "$_tmp"
+  return 0
+}
+
+agmsg_doctor_extra_global() {
+  local type="$1"
+  [ "$type" = "codex" ] || return 0
+  local _sv_findings="${_DOCTOR_FINDINGS_FILE:-}" _sv_gdisplay="${_DOCTOR_GLOBAL_DISPLAY_FILE:-}"
+  local _sv_comps="${_DOCTOR_COMPS_FILE:-}" _tmp
+  _tmp="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-codex-doctor.XXXXXX")"
+  _DOCTOR_FINDINGS_FILE="$_tmp/findings.tsv"; : > "$_DOCTOR_FINDINGS_FILE"
+  _DOCTOR_GLOBAL_DISPLAY_FILE="$_tmp/gdisplay.tsv"; : > "$_DOCTOR_GLOBAL_DISPLAY_FILE"
+  _DOCTOR_COMPS_FILE="$_tmp/comps.tsv"; : > "$_DOCTOR_COMPS_FILE"
+  agmsg_doctor_extra_global_collect "$type" 2>/dev/null
+  _codex_doctor_legacy_render "$_DOCTOR_FINDINGS_FILE" "$_DOCTOR_GLOBAL_DISPLAY_FILE"
+  _DOCTOR_FINDINGS_FILE="$_sv_findings"; _DOCTOR_GLOBAL_DISPLAY_FILE="$_sv_gdisplay"
+  _DOCTOR_COMPS_FILE="$_sv_comps"
+  rm -rf "$_tmp"
   return 0
 }
