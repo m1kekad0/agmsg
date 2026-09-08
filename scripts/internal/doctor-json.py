@@ -17,6 +17,13 @@ produced with one or more findings (partial diagnosability included --
 every undiagnosable scope carries a diagnostic_failure finding, so it is
 always non-empty). stdout carries exactly one JSON payload on 0/1; any
 internal failure exits 2 with stdout empty and an explanation on stderr.
+
+Scoped vs installation-wide classification is by PROJECT presence only:
+a record with a non-empty project belongs to that scope; a record with an
+empty project is installation-wide (global) and keeps its type. Global
+components live in top-level `global_components` (each carrying its own
+`type`); `scopes[].project` is therefore always non-empty -- no fake
+empty-project scope is ever synthesized.
 """
 import argparse
 import json
@@ -40,6 +47,24 @@ def _read_tsv(path, width):
               file=sys.stderr)
         sys.exit(2)
     return rows
+
+
+def _ensure_scope(order, regs, comps, findings, delivery, key):
+    if key not in delivery:
+        order.append(key)
+        regs[key] = []
+        comps[key] = []
+        findings[key] = []
+        delivery[key] = {"mode": "", "status": "unknown"}
+
+
+def _warn_skip_noscope(row):
+    # A scoped-table row with an empty project is an internal inconsistency
+    # (core always records a real project); it must never synthesize a fake
+    # empty-project scope, so it is reported on stderr and left out of the
+    # payload rather than silently dropped or misfiled.
+    print(f"agmsg: doctor --json: skipping record with no project: {row!r}",
+          file=sys.stderr)
 
 
 def _target(kind, team, agent, comp):
@@ -76,13 +101,18 @@ def main():
     comp_rows = _read_tsv(args.components, 7)
     finding_rows = _read_tsv(args.findings, 10)
 
-    # Group observations by scope in first-seen order.
+    # Group observations by scope in first-seen order. Only scopes.tsv rows
+    # (always carrying a real project) and non-empty-project records can
+    # create scopes[] entries; empty-project records are installation-wide.
     order = []
     regs = {}
     comps = {}
     findings = {}
     delivery = {}
     for dproj, stype, mode, dstatus in scope_rows:
+        if not dproj:
+            _warn_skip_noscope((dproj, stype, mode, dstatus))
+            continue
         key = (dproj, stype)
         if key not in delivery:
             order.append(key)
@@ -91,30 +121,36 @@ def main():
             findings[key] = []
             delivery[key] = {"mode": mode, "status": dstatus}
     for dproj, stype, team, agent, lock, watcher in reg_rows:
+        if not dproj:
+            _warn_skip_noscope((dproj, stype, team, agent, lock, watcher))
+            continue
         key = (dproj, stype)
-        if key not in delivery:
-            order.append(key)
-            regs[key] = []
-            comps[key] = []
-            findings[key] = []
-            delivery[key] = {"mode": "", "status": "unknown"}
+        _ensure_scope(order, regs, comps, findings, delivery, key)
         regs[key].append({"team": team, "agent": agent, "lock": lock,
                           "watcher": watcher or None})
     # One component object per (scope, id, instance); signals keep
-    # collection order.
+    # collection order. Empty-project components are installation-wide and
+    # collected into global_components (each carrying its own type).
     comp_index = {}
+    global_comp_index = {}
+    global_components = []
     for dproj, stype, comp, iteam, iagent, scode, sstatus in comp_rows:
-        key = (dproj, stype)
-        if key not in delivery:
-            order.append(key)
-            regs[key] = []
-            comps[key] = []
-            findings[key] = []
-            delivery[key] = {"mode": "", "status": "unknown"}
         instance = None
         if iteam or iagent:
             instance = {"kind": "registration", "team": iteam,
                         "agent": iagent}
+        if not dproj:
+            gkey = (stype, comp, iteam, iagent)
+            if gkey not in global_comp_index:
+                entry = {"id": comp, "type": stype, "instance": instance,
+                         "signals": []}
+                global_comp_index[gkey] = entry
+                global_components.append(entry)
+            global_comp_index[gkey]["signals"].append({"code": scode,
+                                                       "status": sstatus})
+            continue
+        key = (dproj, stype)
+        _ensure_scope(order, regs, comps, findings, delivery, key)
         ckey = (key, comp, iteam, iagent)
         if ckey not in comp_index:
             entry = {"id": comp, "instance": instance, "signals": []}
@@ -133,18 +169,11 @@ def main():
             "target": _target(tkind, tteam, tagent, tcomp),
             "evidence": evidence,
         }
-        if dproj or stype:
+        if dproj:
             key = (dproj, stype)
-            if key not in delivery:
-                order.append(key)
-                regs[key] = []
-                comps[key] = []
-                findings[key] = []
-                delivery[key] = {"mode": "", "status": "unknown"}
+            _ensure_scope(order, regs, comps, findings, delivery, key)
             findings[key].append(finding)
         else:
-            finding["scope"] = {"project": None, "type": stype or None}
-
             findings.setdefault(None, []).append(finding)
 
     scopes = []
@@ -190,6 +219,7 @@ def main():
         },
         "diagnosable": all_diagnosable,
         "scopes": scopes,
+        "global_components": global_components,
         "global_findings": global_findings,
     }
 
@@ -199,5 +229,19 @@ def main():
     return 1
 
 
+def _entrypoint():
+    # Normalize every unexpected failure to the rc 2 contract (stdout empty,
+    # concise human diagnostic on stderr): an uncaught traceback would
+    # otherwise exit 1 with no JSON payload, violating the stable ABI.
+    # The payload is built fully in memory and written to stdout exactly
+    # once, so a failure can never leave a partial JSON document behind.
+    try:
+        return main()
+    except Exception as exc:
+        print(f"agmsg: doctor --json: serializer failed ({exc})",
+              file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_entrypoint())
