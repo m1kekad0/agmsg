@@ -778,3 +778,66 @@ EOF
     fail_assert "stderr must stay concise (no traceback)"
   fi
 }
+
+@test "doctor --json serializer: malformed scopes record with empty project is rc 2, never skipped" {
+  # scopes.tsv rows must always carry a project. An empty-project row is an
+  # internal inconsistency: it must fail closed (rc 2) instead of being
+  # skipped into a false-healthy rc 0 / diagnosable:true payload.
+  local store="$TEST_SKILL_DIR/badscope"
+  mkdir -p "$store"
+  : > "$store/regs.tsv"; : > "$store/comps.tsv"; : > "$store/findings.tsv"
+  printf '\037codex\037turn\037ok\n' > "$store/scopes.tsv"
+  local rc=0
+  python3 "$SCRIPTS/internal/doctor-json.py" \
+    --scopes "$store/scopes.tsv" \
+    --registrations "$store/regs.tsv" \
+    --components "$store/comps.tsv" \
+    --findings "$store/findings.tsv" \
+    --teams 0 >"$store/out.json" 2>"$store/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for malformed scopes record, got $rc"
+  fi
+  if [ -s "$store/out.json" ]; then
+    fail_assert "rc 2 must leave stdout empty"
+  fi
+  if [ ! -s "$store/err.txt" ]; then
+    fail_assert "rc 2 must explain on stderr"
+  fi
+  if grep -q "Traceback" "$store/err.txt"; then
+    fail_assert "stderr must stay concise (no traceback)"
+  fi
+  if ! grep -q "scoped record has no project" "$store/err.txt"; then
+    fail_assert "stderr must name the scoped-record inconsistency"
+  fi
+}
+
+@test "doctor --json serializer: malformed registration record with empty project is rc 2, never skipped" {
+  # registrations.tsv rows must always carry a project; empty-project rows
+  # fail closed the same way as scopes.tsv rows.
+  local store="$TEST_SKILL_DIR/badreg"
+  mkdir -p "$store"
+  : > "$store/scopes.tsv"; : > "$store/comps.tsv"; : > "$store/findings.tsv"
+  printf '\037codex\037team\037alice\037alive\037none\n' > "$store/regs.tsv"
+  local rc=0
+  python3 "$SCRIPTS/internal/doctor-json.py" \
+    --scopes "$store/scopes.tsv" \
+    --registrations "$store/regs.tsv" \
+    --components "$store/comps.tsv" \
+    --findings "$store/findings.tsv" \
+    --teams 0 >"$store/out.json" 2>"$store/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for malformed registration record, got $rc"
+  fi
+  if [ -s "$store/out.json" ]; then
+    fail_assert "rc 2 must leave stdout empty"
+  fi
+  if [ ! -s "$store/err.txt" ]; then
+    fail_assert "rc 2 must explain on stderr"
+  fi
+  if grep -q "Traceback" "$store/err.txt"; then
+    fail_assert "stderr must stay concise (no traceback)"
+  fi
+  if ! grep -q "scoped record has no project" "$store/err.txt"; then
+    fail_assert "stderr must name the scoped-record inconsistency"
+  fi
+}

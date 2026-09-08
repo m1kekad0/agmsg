@@ -58,13 +58,13 @@ def _ensure_scope(order, regs, comps, findings, delivery, key):
         delivery[key] = {"mode": "", "status": "unknown"}
 
 
-def _warn_skip_noscope(row):
-    # A scoped-table row with an empty project is an internal inconsistency
-    # (core always records a real project); it must never synthesize a fake
-    # empty-project scope, so it is reported on stderr and left out of the
-    # payload rather than silently dropped or misfiled.
-    print(f"agmsg: doctor --json: skipping record with no project: {row!r}",
-          file=sys.stderr)
+def _reject_noscope(row):
+    # A scoped-table row (scopes.tsv / registrations.tsv) with an empty
+    # project is an internal inconsistency: those tables must always carry
+    # a real project. Silently dropping the record could yield rc 0 with
+    # diagnosable:true (false healthy), so fail closed via the rc 2 path
+    # in _entrypoint() instead.
+    raise ValueError(f"scoped record has no project: {row!r}")
 
 
 def _target(kind, team, agent, comp):
@@ -111,8 +111,7 @@ def main():
     delivery = {}
     for dproj, stype, mode, dstatus in scope_rows:
         if not dproj:
-            _warn_skip_noscope((dproj, stype, mode, dstatus))
-            continue
+            _reject_noscope((dproj, stype, mode, dstatus))
         key = (dproj, stype)
         if key not in delivery:
             order.append(key)
@@ -122,8 +121,7 @@ def main():
             delivery[key] = {"mode": mode, "status": dstatus}
     for dproj, stype, team, agent, lock, watcher in reg_rows:
         if not dproj:
-            _warn_skip_noscope((dproj, stype, team, agent, lock, watcher))
-            continue
+            _reject_noscope((dproj, stype, team, agent, lock, watcher))
         key = (dproj, stype)
         _ensure_scope(order, regs, comps, findings, delivery, key)
         regs[key].append({"team": team, "agent": agent, "lock": lock,
