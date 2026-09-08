@@ -486,8 +486,12 @@ EOF
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type claude-code
   [ "$status" -eq 1 ] # human run
-  [[ "$output" == *"legacy fixture warning (unstructured)"* ]]
-  [[ "$output" == *"Codex legacy line for display"* ]]
+  if ! printf '%s\n' "$output" | grep -qF "legacy fixture warning (unstructured)"; then
+    fail_assert "human mode missing legacy warning text"
+  fi
+  if ! printf '%s\n' "$output" | grep -qF "Codex legacy line for display"; then
+    fail_assert "human mode missing legacy display line"
+  fi
 }
 
 @test "doctor --json: one undiagnosable scope does not discard the healthy scope" {
@@ -539,7 +543,9 @@ EOF
   refute grep -qF "$HOME" "$JSON_OUT"
   # Human output agrees on the same mapping.
   run bash "$SCRIPTS/doctor.sh" --project "$home_proj" --type claude-code --redacted
-  [[ "$output" == *"team1/agent1"* ]]
+  if ! printf '%s\n' "$output" | grep -qF "team1/agent1"; then
+    fail_assert "human report disagrees on pseudonyms"
+  fi
 }
 
 @test "doctor --json --redacted: session-like identifiers are masked in evidence" {
