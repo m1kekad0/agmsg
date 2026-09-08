@@ -440,6 +440,7 @@ _doctor_flat() {
 #   delivery_status_failed        delivery.sh status itself failed (diagnostic_failure/runtime, scope target)
 #   watcher_stale_pidfile_global  stale watcher pidfile, installation-wide (condition/runtime, global)
 #   legacy_plug_unstructured      type plug without structured collectors (diagnostic_failure/unknown)
+#   plug_collector_failed         structured collector exited nonzero (diagnostic_failure/unknown)
 #
 # _doctor_warn <code> <kind> <category> <scope_project_raw> <scope_type>
 #              <target_kind> <target_team_raw> <target_agent_raw> <target_component>
@@ -879,10 +880,19 @@ _doctor_scan_pair() {
     # lines land in the store files, not on stdout. Stdout is redirected to
     # stderr so a stray plug print can never pollute the --json payload (or
     # silently vanish from the human report); by contract the plug prints
-    # nothing there.
+    # nothing there. A nonzero collector exit is captured, never left to
+    # trip set -e mid-scan (which would end the run with rc 1 and an empty
+    # stdout, violating the exit contract): the scope keeps whatever else
+    # was observed and records a plug_collector_failed diagnostic_failure.
     _plug_fmark="$(wc -l < "$_DOCTOR_FINDINGS_FILE" | tr -d ' ')"
     _plug_dmark="$(wc -l < "$_DOCTOR_DISPLAY_FILE" | tr -d ' ')"
-    agmsg_doctor_extra_collect "$type" "$project" 1>&2
+    _plug_collector_rc=0
+    agmsg_doctor_extra_collect "$type" "$project" 1>&2 || _plug_collector_rc=$?
+    if [ "$_plug_collector_rc" -ne 0 ]; then
+      agmsg_doctor_finding_add plug_collector_failed diagnostic_failure unknown \
+        "$project" "$type" "" "" "" "" \
+        "type plug collector for '$type' exited $_plug_collector_rc during this scope's scan; structured observations for this scope may be incomplete"
+    fi
     if [ "$JSON_MODE" -eq 0 ]; then
       _doctor_render_plug_store "$project" "$type" "$((_plug_fmark + 1))" "$((_plug_dmark + 1))"
       if [ -n "$_RENDERED_PLUG_DISPLAY" ]; then
@@ -916,7 +926,7 @@ _doctor_scan_pair() {
       fi
     fi
   fi
-  unset _extra_plug _extra_has_collect _plug_fmark _plug_dmark _extra_output _extra_warns _extra_warn _extra_warn_red _extra_display
+  unset _extra_plug _extra_has_collect _plug_fmark _plug_dmark _plug_collector_rc _extra_output _extra_warns _extra_warn _extra_warn_red _extra_display
 
   # type is already validated (or came from the registry) before this is
   # ever called, so this is not the "unknown type" case -- some other
@@ -1088,7 +1098,16 @@ if [ -z "$FILTER_PROJECT" ]; then
       . "$_extra_plug" 2>/dev/null || true
       _plug_gfmark="$(wc -l < "$_DOCTOR_FINDINGS_FILE" | tr -d ' ')"
       _plug_gdmark="$(wc -l < "$_DOCTOR_GLOBAL_DISPLAY_FILE" | tr -d ' ')"
-      agmsg_doctor_extra_global_collect "$_extra_type" 1>&2
+      # Same nonzero capture as the per-pair collector above: a failing
+      # global collector degrades to a diagnostic_failure finding, never to
+      # an aborted run with an empty stdout.
+      _plug_gcollector_rc=0
+      agmsg_doctor_extra_global_collect "$_extra_type" 1>&2 || _plug_gcollector_rc=$?
+      if [ "$_plug_gcollector_rc" -ne 0 ]; then
+        agmsg_doctor_finding_add plug_collector_failed diagnostic_failure unknown \
+          "" "$_extra_type" "" "" "" "" \
+          "type plug global collector for '$_extra_type' exited $_plug_gcollector_rc; installation-wide observations may be incomplete"
+      fi
       if [ "$JSON_MODE" -eq 0 ]; then
         _doctor_render_global_store "$_extra_type" "$((_plug_gfmark + 1))" "$((_plug_gdmark + 1))"
       fi
@@ -1117,7 +1136,7 @@ if [ -z "$FILTER_PROJECT" ]; then
   done <<< "$GLOBAL_PLUG_TYPES" || true
 fi
 unset _extra_type _extra_plug _extra_output _extra_warns _extra_warn _extra_display
-unset _plug_path _plug_type _plug_gfmark _plug_gdmark GLOBAL_PLUG_TYPES
+unset _plug_path _plug_type _plug_gfmark _plug_gdmark _plug_gcollector_rc GLOBAL_PLUG_TYPES
 WARN_COUNT="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
 
 # --json: the scan above collected everything into the store; serialize it

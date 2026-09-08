@@ -97,6 +97,36 @@ assert_valid_json() {
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$JSON_OUT"
 }
 
+# Explicit-failure assertion helpers for the ABI/security tests below: a
+# bare failing [[ ... ]] aborts the test under set -e with no message, so
+# these name the expectation and the actual value instead.
+fail_assert() {
+  echo "ASSERT-FAIL: $1" >&2
+  return 1
+}
+
+assert_json_eq() {
+  local actual expected="$2"
+  actual="$(json_get "$1")"
+  if [ "$actual" != "$expected" ]; then
+    fail_assert "json $1: expected [$expected], got [$actual]"
+  fi
+}
+
+assert_json_python() {
+  # $1: python expression over loaded payload `d` (stdout.json); $2: message.
+  if ! python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert ('"$1"'), sys.argv[2]' "$JSON_OUT" "$2"; then
+    fail_assert "$2"
+  fi
+}
+
+assert_absent() {
+  # $1: raw value that must not appear anywhere in the payload; $2: label.
+  if grep -qF "$1" "$JSON_OUT"; then
+    fail_assert "payload leaks $2"
+  fi
+}
+
 configured_off() {
   mkdir -p "$1/.claude"
   printf '%s\n' '{"hooks":{}}' > "$1/.claude/settings.local.json"
@@ -579,4 +609,166 @@ EOF
   [ "$JSON_STATUS" -eq 0 ]
   assert_valid_json
   [ "$(json_get '["scopes"][0]["project"]')" = "$spaced" ]
+}
+
+# --- installation-wide (global) records --------------------------------------
+#
+# Classification is by project presence only: empty-project records are
+# global, keep their type, and never synthesize a fake "" scope.
+
+write_orphan_appserver() {
+  # An app-server triple whose hash matches no registered project.
+  local _uh="abcdef0123456789abcdef0123456789abcdef01" dead
+  dead="$(dead_pid)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$dead" > "$TEST_SKILL_DIR/run/codex-app-server.$_uh.pid"
+  printf '%s\n' "64331" > "$TEST_SKILL_DIR/run/codex-app-server.$_uh.port"
+  printf '%s\n' "codex-cli 9.9.9-test" > "$TEST_SKILL_DIR/run/codex-app-server.$_uh.version"
+}
+
+@test "doctor --json: orphan app-server is a global finding, never a fake empty scope" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  write_orphan_appserver
+
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for orphan records, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_eq '["global_findings"][0]["code"]' "codex_pid_stale"
+  assert_json_eq '["global_findings"][0]["kind"]' "condition"
+  assert_json_eq '["global_findings"][0]["scope"]["project"]' "None"
+  assert_json_eq '["global_findings"][0]["scope"]["type"]' "codex"
+  assert_json_eq '["global_findings"][0]["target"]["kind"]' "component"
+  assert_json_eq '["global_findings"][0]["target"]["component_id"]' "codex_app_server"
+  assert_json_eq '["global_findings"][0]["target"]["instance"]' "None"
+  # The registered scope keeps its own (empty) findings; summary.scopes is
+  # not inflated by the global record.
+  assert_json_eq '["summary"]["scopes"]' "1"
+  assert_json_eq '["scopes"][0]["project"]' "$PROJ"
+  assert_json_python 'all(s["project"] for s in d["scopes"])' 'scopes[] contains an empty project'
+  assert_json_python '"global_components" in d' 'global_components field missing'
+}
+
+@test "doctor --json: unattributed bridge is a global finding with a global component" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  local dead
+  dead="$(dead_pid)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  # A launcher-generation key no per-pair call attributes (not team.alice).
+  printf '%s\n' "$dead" > "$TEST_SKILL_DIR/run/codex-bridge.ghost.role.pid"
+  printf '%s' "ws://127.0.0.1:1" > "$TEST_SKILL_DIR/run/codex-bridge.ghost.role.appserver"
+  printf '%s' "thread-ghost" > "$TEST_SKILL_DIR/run/codex-bridge.ghost.role.thread"
+
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for unattributed bridge, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'any(f["code"]=="codex_bridge_stale_pidfile" and f["scope"]=={"project": None, "type": "codex"} for f in d["global_findings"])' 'missing global codex_bridge_stale_pidfile finding'
+  assert_json_python 'any(c["id"]=="codex_bridge" and c["type"]=="codex" and c["instance"] is None and any(s=={"code": "process", "status": "not-running"} for s in c["signals"]) for c in d["global_components"])' 'missing global codex_bridge component signal'
+  assert_json_python 'all(s["project"] for s in d["scopes"])' 'scopes[] contains an empty project'
+  assert_json_eq '["summary"]["scopes"]' "1"
+}
+
+@test "doctor --json: orphan app-server triple also surfaces a global component" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  write_orphan_appserver
+
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for orphan triple, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'any(c["id"]=="codex_app_server" and c["type"]=="codex" and c["instance"] is None for c in d["global_components"])' 'missing global codex_app_server component'
+}
+
+# --- collector failure: diagnostic_failure, never empty-stdout rc 1 ---------
+
+install_failing_plug() {
+  # $1: per-pair exit, $2: global exit. A structured plug whose collector
+  # fails without recording anything.
+  cat > "$TYPES/claude-code/_doctor.sh" <<EOF
+[ -n "\${_AGMSG_FAILFIX_SH:-}" ] && return 0
+_AGMSG_FAILFIX_SH=1
+agmsg_doctor_extra_collect() { return $1; }
+agmsg_doctor_extra_global_collect() { return $2; }
+EOF
+}
+
+@test "doctor --json: failing per-pair collector is plug_collector_failed with rc 1 JSON" {
+  install_failing_plug 1 0
+  configured_off "$PROJ"
+
+  run_json --project "$PROJ" --type claude-code
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for failing collector, got $JSON_STATUS"
+  fi
+  if [ ! -s "$JSON_OUT" ]; then
+    fail_assert "rc 1 with empty stdout (JSON missing)"
+  fi
+  assert_valid_json
+  assert_json_eq '["scopes"][0]["diagnosable"]' "False"
+  assert_json_eq '["diagnosable"]' "False"
+  assert_json_eq '["scopes"][0]["findings"][0]["code"]' "plug_collector_failed"
+  assert_json_eq '["scopes"][0]["findings"][0]["kind"]' "diagnostic_failure"
+  # Machine judgment needs no evidence parsing, but the rc is kept as context.
+  assert_json_python '"1" in d["scopes"][0]["findings"][0]["evidence"]' 'collector rc missing from evidence'
+
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type claude-code
+  if [ "$status" -ne 1 ]; then
+    fail_assert "human mode should also warn (rc 1), got $status"
+  fi
+  if ! printf '%s\n' "$output" | grep -q "plug collector"; then
+    fail_assert "human mode missing collector failure warning"
+  fi
+}
+
+@test "doctor --json: failing global collector fails only the global diagnosis" {
+  install_failing_plug 0 1
+  configured_off "$PROJ"
+
+  run_json --type claude-code
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for failing global collector, got $JSON_STATUS"
+  fi
+  if [ ! -s "$JSON_OUT" ]; then
+    fail_assert "rc 1 with empty stdout (JSON missing)"
+  fi
+  assert_valid_json
+  assert_json_eq '["scopes"][0]["diagnosable"]' "True"
+  assert_json_eq '["diagnosable"]' "False"
+  assert_json_python 'any(f["code"]=="plug_collector_failed" and f["kind"]=="diagnostic_failure" and f["scope"]=={"project": None, "type": "claude-code"} for f in d["global_findings"])' 'missing global plug_collector_failed finding'
+}
+
+# --- serializer failure: always rc 2 ----------------------------------------
+
+@test "doctor --json serializer: invalid store bytes are rc 2 with empty stdout" {
+  local store="$TEST_SKILL_DIR/badstore"
+  mkdir -p "$store"
+  : > "$store/regs.tsv"; : > "$store/comps.tsv"; : > "$store/findings.tsv"
+  printf 'x\037codex\037mode\037ok\xff\xfe\n' > "$store/scopes.tsv"
+  local rc=0
+  python3 "$SCRIPTS/internal/doctor-json.py" \
+    --scopes "$store/scopes.tsv" \
+    --registrations "$store/regs.tsv" \
+    --components "$store/comps.tsv" \
+    --findings "$store/findings.tsv" \
+    --teams 0 >"$store/out.json" 2>"$store/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for serializer failure, got $rc"
+  fi
+  if [ -s "$store/out.json" ]; then
+    fail_assert "rc 2 must leave stdout empty"
+  fi
+  if [ ! -s "$store/err.txt" ]; then
+    fail_assert "rc 2 must explain on stderr"
+  fi
+  if grep -q "Traceback" "$store/err.txt"; then
+    fail_assert "stderr must stay concise (no traceback)"
+  fi
 }

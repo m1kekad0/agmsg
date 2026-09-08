@@ -91,11 +91,21 @@ the human text; consume the JSON:
   reports the healthy scopes instead of failing the whole run.
 - `scopes[]`: per `(project, type)` — `registrations` (lock/watcher state),
   `delivery` (mode + ok/failed/skipped), type-specific `components` with
-  observation `signals`, and `findings`.
-- `global_findings`: installation-wide findings (scope `project: null`).
+  observation `signals`, and `findings`. Every `scopes[]` entry has a
+  non-empty `project`.
+- `global_components`: installation-wide type components (e.g. unattributed
+  Codex bridge bindings), each carrying its own `type` alongside `id`,
+  `instance`, and `signals`.
+- `global_findings`: installation-wide findings (scope `project: null`,
+  `type` kept when it belongs to one type).
+
+Scoped vs installation-wide is classified by project presence only: a
+record with a project belongs to that scope; a record without one is
+global. Global records never synthesize a fake empty-project scope, and
+never inflate `summary.scopes`.
 
 Findings carry a stable snake_case `code` (e.g. `lock_stale`,
-`codex_version_drift`), a `kind` (`condition` = noteworthy state observed,
+`codex_version_drift`, `legacy_plug_unstructured`, `plug_collector_failed`), a `kind` (`condition` = noteworthy state observed,
 `diagnostic_failure` = that range could not be fully diagnosed), an advisory
 `category` (`messaging` | `runtime` | `unknown`), a structured `target`
 (registration / component / null for scope-wide), and human-readable
