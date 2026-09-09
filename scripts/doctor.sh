@@ -3,8 +3,14 @@ set -euo pipefail
 
 # doctor.sh — "who holds what" in one screen. #267/#605.
 #
-# Usage: doctor.sh [--project <path>] [--type <type>] [--team <team>] [--redacted]
+# Usage: doctor.sh [--project <path>] [--type <type>] [--team <team>] [--redacted] [--json]
 #        doctor.sh --help
+#
+# --json emits the same diagnosis as a single machine-readable JSON payload
+# on stdout (Issue #8, schema_version 1 -- see docs/building-on-agmsg.md).
+# The JSON and the human-readable report are drawn from the same structured
+# observations / findings collected during the scan; the JSON path never
+# parses human warning text back into codes.
 #
 # Default (no filters): the whole installation -- every team, every project,
 # every type. --project / --type / --team narrow it and combine freely. This
@@ -46,8 +52,10 @@ set -euo pipefail
 #   2  usage or resolution error
 
 _usage() {
-  echo "Usage: doctor.sh [--project <path>] [--type <type>] [--team <team>] [--redacted]" >&2
+  echo "Usage: doctor.sh [--project <path>] [--type <type>] [--team <team>] [--redacted] [--json]" >&2
   echo "       doctor.sh --help" >&2
+  echo "  --json: print a single machine-readable JSON payload (schema_version 1) on" >&2
+  echo "          stdout and nothing else; rc 2 errors stay human text on stderr." >&2
 }
 
 # Scanned for --help before anything else is parsed, same reasoning as
@@ -65,6 +73,7 @@ unset _arg
 #     a parsing-only change. No positional arguments are accepted -- any
 #     bare token is a usage error. -----------------------------------------
 REDACTED=0
+JSON_MODE=0
 FILTER_PROJECT="" FILTER_TYPE="" FILTER_TEAM=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -78,6 +87,7 @@ while [ "$#" -gt 0 ]; do
       case "${2:-}" in ''|-*) echo "doctor: --team requires a value" >&2; exit 2 ;; esac
       FILTER_TEAM="$2"; shift 2 ;;
     --redacted) REDACTED=1; shift ;;
+    --json) JSON_MODE=1; shift ;;
     -*) echo "doctor: unknown option: $1" >&2; exit 2 ;;
     *) echo "doctor: unexpected argument: '$1' (doctor takes flags only -- see --help)" >&2; exit 2 ;;
   esac
@@ -94,6 +104,43 @@ RUN_DIR="$SKILL_DIR/run"
 . "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/validate.sh"
+# Shared structured delivery evaluator (P1-4): doctor は human text を parse
+# せず、この evaluator を直接呼ぶ。human renderer も同一 evaluator から
+# 描画するため wording 変更では machine JSON は壊れない。
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/delivery-eval.sh"
+
+# --- fatal-error boundary for --json (P1-2) --------------------------------
+# JSON mode では scan 全体を明示的な boundary で保護する: unexpected
+# internal/setup 失敗は rc2・stdout 空・stderr concise へ正規化する。
+# 個別に `|| true` を増やして silent degradation させない。
+_doctor_fatal() {
+  printf 'doctor: %s\n' "${1:-internal failure during machine-readable scan}" >&2
+  exit 2
+}
+_doctor_json_err_trap() {
+  printf 'doctor: internal failure during machine-readable scan\n' >&2
+  exit 2
+}
+if [ "$JSON_MODE" -eq 1 ]; then
+  # ERR trap を functions/command substitutions/subshells へ継承させる
+  # (errtrace)。mktemp/store write 等の $(...) 内失敗も rc2 へ正規化する
+  # ため。`||` で明示処理した per-scope partial (diagnostic_failure) は
+  # trap を発火させない。
+  set -E
+  trap '_doctor_json_err_trap' ERR
+fi
+
+# --json is serialized by a Python helper (escaping / schema shaping live
+# there, not in Bash string concatenation -- the same split team-list.sh /
+# scripts/internal/team-list.py already uses). A missing python3 means no
+# authoritative report can be produced, so this is a resolution-class error
+# (exit 2, stdout empty, human text on stderr), never a degraded JSON run.
+if [ "$JSON_MODE" -eq 1 ]; then
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/lib/require-python3.sh"
+  agmsg_require_python3 "doctor --json" || exit 2
+fi
 
 # --project / --type / --team all validated here, before any scope work:
 # an unknown --type or --team is a usage error (exit 2), not left to fail
@@ -332,8 +379,12 @@ _redact_text() {
   # $HOME prefix to catch), and delivery.sh's own output names it directly
   # (its settings-hooks-file path is under it) -- so the exact resolved path
   # is masked here too, the same pseudonym _redact_project produces for it.
-  _redact_project "$project"
-  text="$(_replace_literal "$text" "$project" "$_REDACT_OUT")"
+  # Skipped for installation-wide text with no project: masking an empty
+  # needle is a no-op but registering it would consume a <projectN> number.
+  if [ -n "$project" ]; then
+    _redact_project "$project"
+    text="$(_replace_literal "$text" "$project" "$_REDACT_OUT")"
+  fi
   n=${#_R_TEAM_K[@]}
   for ((i = 0; i < n; i++)); do
     text="$(_replace_literal "$text" "${_R_TEAM_K[$i]}" "${_R_TEAM_V[$i]}")"
@@ -342,7 +393,370 @@ _redact_text() {
   for ((i = 0; i < n; i++)); do
     text="$(_replace_literal "$text" "${_R_AGENT_K[$i]}" "${_R_AGENT_V[$i]}")"
   done
+  n=${#_R_SECRET_K[@]}
+  for ((i = 0; i < n; i++)); do
+    text="$(_replace_literal "$text" "${_R_SECRET_K[$i]}" "${_R_SECRET_V[$i]}")"
+  done
+  # Global opaque keys (P1-5 defense in depth): raw orphan hash / bridge key
+  # が evidence/display へ混入しても --redacted では opaque へ置換する。
+  # 通常は plug が事前に opaque 化するためこの置換は no-op である。
+  n=${#_R_GLOBAL_K[@]}
+  for ((i = 0; i < n; i++)); do
+    text="$(_replace_literal "$text" "${_R_GLOBAL_K[$i]}" "${_R_GLOBAL_V[$i]}")"
+  done
   printf '%s' "$text"
+}
+
+# Session-like identifiers (bridge bound-thread / recorded-seat uuids, etc.)
+# are neither team/agent names nor paths, so the tables above never catch
+# them -- but --redacted promises paste-safe output including evidence. A
+# plug registers such values via agmsg_doctor_note_secret; they are then
+# masked everywhere _redact_text runs (human blocks and JSON evidence alike)
+# under the same "same raw value, same pseudonym, one table per run" rule.
+# No-op unless --redacted (and unless anything was registered), so plain
+# output keeps the full values a human needs to match against logs.
+_R_SECRET_K=(); _R_SECRET_V=()
+agmsg_doctor_note_secret() {
+  [ "$REDACTED" = 1 ] || return 0
+  [ -n "${1:-}" ] || return 0
+  local i n=${#_R_SECRET_K[@]}
+  for ((i = 0; i < n; i++)); do
+    if [ "${_R_SECRET_K[$i]}" = "$1" ]; then return 0; fi
+  done
+  _R_SECRET_K[$n]="$1"; _R_SECRET_V[$n]="session$((n + 1))"
+}
+
+# Global opaque instance pseudonyms (P1-5/P1-6): orphan app-server hash や
+# unattributed bridge key のような、current registration の redaction table
+# に存在しない raw 識別子を human evidence へ入れる前に paste-safe opaque
+# へ変換する。filename 由来文字列を「必ず team.agent」と仮定しない。
+# 同一 invocation では same raw → same pseudonym を保証する。--redacted の
+# 有無にかかわらず常に opaque 化する (raw PID/hash/URL/socket/path を
+# structured field に出さない契約のため)。
+_R_GLOBAL_K=(); _R_GLOBAL_V=()
+_doctor_global_pseudonym() {
+  # $1: raw key (hash / bridge key 等)。_GLOBAL_OUT に opaque ID を設定。
+  local raw="${1:-}" i n=${#_R_GLOBAL_K[@]}
+  [ -n "$raw" ] || { _GLOBAL_OUT=""; return 0; }
+  for ((i = 0; i < n; i++)); do
+    if [ "${_R_GLOBAL_K[$i]}" = "$raw" ]; then _GLOBAL_OUT="${_R_GLOBAL_V[$i]}"; return 0; fi
+  done
+  _R_GLOBAL_K[$n]="$raw"; _R_GLOBAL_V[$n]="global_instance$((n + 1))"
+  _GLOBAL_OUT="${_R_GLOBAL_V[$n]}"
+}
+
+# --- structured diagnostics store (Issue #8) --------------------------------
+#
+# Observations and findings are the PRIMARY record of a scan: every warning
+# below registers a structured finding (stable code, kind, category, scope,
+# target, evidence) at the same site that builds the human line, and the
+# human "warnings:" section plus the --json payload are both drawn from that
+# store. Nothing here parses a WARN string back into a code -- the code is
+# assigned once, where the condition is observed.
+#
+# Storage is one record file per kind inside a per-run temp dir (portable
+# to bash 3.2 -- no associative arrays), with \037 (ASCII unit separator)
+# as the field separator: it is not IFS whitespace, so `read` preserves
+# empty fields (which TAB cannot do), and unlike \001 it is honored as an
+# IFS delimiter by bash 3.2's read builtin. The Python serializer does all
+# JSON escaping, so quotes / backslashes / }] in paths or evidence can never
+# break the payload. All values are written post-redaction (the same tables
+# above), so the serializer never sees a raw value and --redacted --json
+# cannot leak one. Global opaque instance IDs (P1-5/P1-6) travel as an
+# explicit trailing field, never as raw PID/hash/URL/socket/path.
+_DOCTOR_TMP=""; _DOCTOR_SCOPES_FILE=""; _DOCTOR_REGS_FILE=""
+_DOCTOR_COMPS_FILE=""; _DOCTOR_FINDINGS_FILE=""
+_DOCTOR_DISPLAY_FILE=""; _DOCTOR_GLOBAL_DISPLAY_FILE=""
+_doctor_store_init() {
+  _DOCTOR_TMP="$(mktemp -d "${TMPDIR:-/tmp}/agmsg-doctor.XXXXXX")"
+  _DOCTOR_SCOPES_FILE="$_DOCTOR_TMP/scopes.tsv"
+  _DOCTOR_REGS_FILE="$_DOCTOR_TMP/regs.tsv"
+  _DOCTOR_COMPS_FILE="$_DOCTOR_TMP/comps.tsv"
+  _DOCTOR_FINDINGS_FILE="$_DOCTOR_TMP/findings.tsv"
+  _DOCTOR_DISPLAY_FILE="$_DOCTOR_TMP/display.tsv"
+  _DOCTOR_GLOBAL_DISPLAY_FILE="$_DOCTOR_TMP/global_display.tsv"
+  # 各 write を明示的に fatal 化する: collector は `|| rc=$?` で呼ばれる
+  # ため Bash 3.2 では内側の set -e / ERR trap が信頼できず、裸の write
+  # 失敗は false healthy (rc0/record missing) になり得る。
+  : > "$_DOCTOR_SCOPES_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_REGS_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_COMPS_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_FINDINGS_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_DISPLAY_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_GLOBAL_DISPLAY_FILE" || _doctor_fatal "failed to init scan store"
+}
+# Control-char singletons ($'...' は command substitution と異なり末尾改行
+# strip が起きない。$(printf '\n') は空文字になるため *""* が全値に match
+# する事故を起こす。bash 3.2 の ANSI-C quoting で定義する)。
+TAB_CHAR=$'\t'
+LF_CHAR=$'\n'
+CR_CHAR=$'\r'
+US_CHAR=$'\037'
+X01_CHAR=$'\001'
+# Input-boundary validation (P2): control characters are rejected, never
+# lossily flattened. TAB/newline/CR/unit-separator in any store field would
+# either break TSV framing (newline splits rows) or collide distinct raw
+# values into one representation (TAB→space). Stable ABI 前のため今回直す:
+# identifier/scope field は rc2 fail-closed、evidence も同一境界で reject
+# する (human free text でも複数行 evidence は store 行を壊すため)。
+# _doctor_fatal で直接 exit 2 する (set -e + ERR trap だけに頼らない):
+# plug collector は `|| _plug_collector_rc=$?` で呼ばれるため、その内側では
+# set -e が無効化され、bare な return 1 では fail-closed にならず空 evidence
+# 化して silent 継続してしまう。呼び側は `|| true` で握り潰さないこと。
+_doctor_flat() {
+  local _v="${1:-}"
+  case "$_v" in
+    *"$TAB_CHAR"*|*"$LF_CHAR"*|*"$CR_CHAR"*|*"$US_CHAR"*|*"$X01_CHAR"*)
+      printf 'doctor: rejected control character in store field\n' >&2
+      _doctor_fatal "rejected control character in store field"
+      ;;
+  esac
+  _FLAT_OUT="$_v"
+}
+# Raw control-char validation (P2 ordering): redaction や command
+# substitution の前に RAW 値へかける。$() は末尾 newline を削除し、
+# redaction は raw を pseudonym へ置換して control char を隠すため、
+# 変換後の検査だけでは trailing newline の消失と redacted 時のすり抜けを
+# 検出できない。正しい順序は RAW validation → redaction → post 検証 →
+# store write である。全 store-bound 値の redaction/$() より前に呼ぶこと。
+_doctor_validate_raw_field() {
+  local _v="${1:-}"
+  case "$_v" in
+    *"$TAB_CHAR"*|*"$LF_CHAR"*|*"$CR_CHAR"*|*"$US_CHAR"*|*"$X01_CHAR"*)
+      printf 'doctor: rejected control character in store field\n' >&2
+      _doctor_fatal "rejected control character in store field"
+      ;;
+  esac
+}
+# Scope finding codes (core doctor warnings):
+#   lock_stale                    stale actas lock (condition/messaging, registration target)
+#   lock_no_watcher               live lock with no watcher pidfile (condition/messaging, registration)
+#   turn_mode_multi_registration  >1 registration under turn/both delivery (condition/messaging, scope target)
+#   watcher_stale_pidfile         stale watcher/bridge pidfile, per-pair (condition/runtime, scope target)
+#   delivery_status_failed        delivery evaluation itself failed, scoped or global (diagnostic_failure/runtime)
+#   watcher_stale_pidfile_global  stale watcher pidfile, installation-wide (condition/runtime, global)
+#   legacy_plug_unstructured      type plug without structured collectors (diagnostic_failure/unknown)
+#   plug_collector_failed         structured collector exited nonzero, or plug source failed (diagnostic_failure/unknown)
+#   scan_failed                   per-scope identities/helper lookup failed (diagnostic_failure/unknown)
+#
+# _doctor_warn <code> <kind> <category> <scope_project_raw> <scope_type>
+#              <target_kind> <target_team_raw> <target_agent_raw> <target_component>
+#              -- <human warning line, already built>
+# Appends the human line to WARNINGS (unchanged rendering) AND a structured
+# record to the store. target_kind is "registration", "component", or ""
+# (scope/global target, serialized as null). Evidence is the human line minus
+# a leading "[...] " scope prefix, passed through _redact_text so secrets
+# registered after the line was built are still masked. Core warnings never
+# carry an opaque instance (empty trailing field).
+_doctor_warn() {
+  local code="$1" kind="$2" category="$3" sproj="$4" stype="$5"
+  local tkind="$6" tteam="$7" tagent="$8" tcomp="$9"
+  shift 9
+  case "${1:-}" in --) shift ;; esac
+  local human="$1" dproj="" dteam="" dagent="" evidence=""
+  # RAW validation first: redaction/$() の前に検査する ($() は末尾 newline
+  # を削除し、redaction は raw を pseudonym へ置換して control char を隠す)。
+  _doctor_validate_raw_field "$code"; _doctor_validate_raw_field "$kind"
+  _doctor_validate_raw_field "$category"; _doctor_validate_raw_field "$sproj"
+  _doctor_validate_raw_field "$stype"; _doctor_validate_raw_field "$tkind"
+  _doctor_validate_raw_field "$tteam"; _doctor_validate_raw_field "$tagent"
+  _doctor_validate_raw_field "$tcomp"; _doctor_validate_raw_field "$human"
+  WARNINGS="${WARNINGS}${human}"$'\n'
+  [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
+  if [ -n "$tkind" ] && [ -n "$tteam" ]; then _redact_team "$tteam"; dteam="$_REDACT_OUT"; fi
+  if [ -n "$tkind" ] && [ -n "$tagent" ]; then _redact_agent "$tagent"; dagent="$_REDACT_OUT"; fi
+  evidence="$human"
+  case "$evidence" in \[*\]*\ *) evidence="${evidence#*] }" ;; esac
+  evidence="$(_redact_text "$evidence" "$sproj")"
+  _doctor_flat "$code"; local fcode="$_FLAT_OUT"
+  _doctor_flat "$kind"; local fkind="$_FLAT_OUT"
+  _doctor_flat "$category"; local fcat="$_FLAT_OUT"
+  _doctor_flat "$dproj"; local fsproj="$_FLAT_OUT"
+  _doctor_flat "$stype"; local fstype="$_FLAT_OUT"
+  _doctor_flat "$tkind"; local ftkind="$_FLAT_OUT"
+  _doctor_flat "$dteam"; local ftteam="$_FLAT_OUT"
+  _doctor_flat "$dagent"; local ftagent="$_FLAT_OUT"
+  _doctor_flat "$tcomp"; local ftcomp="$_FLAT_OUT"
+  _doctor_flat "$evidence"; local fev="$_FLAT_OUT"
+  printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
+    "$fcode" "$fkind" "$fcat" "$fsproj" "$fstype" \
+    "$ftkind" "$ftteam" "$ftagent" "$ftcomp" "$fev" "" >> "$_DOCTOR_FINDINGS_FILE" || _doctor_fatal "failed to append finding"
+}
+# Structured collector API for type plugs (Issue #8 "New collector
+# entrypoints" protocol). A plug implementing
+#   agmsg_doctor_extra_collect <type> <project>
+#   agmsg_doctor_extra_global_collect <type>
+# calls these with RAW values; redaction to the run's single mapping table
+# happens here, so text and JSON always agree. These functions MUST NOT print
+# to stdout (the scan runs in the caller's shell; display lines go to the
+# display store, findings to the findings store). Optional trailing opaque
+# instance ID (P1-6, e.g. global_instance1) distinguishes multiple global
+# components sharing one id; empty means registration instance or null.
+agmsg_doctor_finding_add() {
+  local code="${1:-}" kind="${2:-}" category="${3:-}" sproj="${4:-}" stype="${5:-}"
+  local tkind="${6:-}" tteam="${7:-}" tagent="${8:-}" tcomp="${9:-}" evidence="${10:-}"
+  local opaque="${11:-}"
+  _doctor_validate_raw_field "$code"; _doctor_validate_raw_field "$kind"
+  _doctor_validate_raw_field "$category"; _doctor_validate_raw_field "$sproj"
+  _doctor_validate_raw_field "$stype"; _doctor_validate_raw_field "$tkind"
+  _doctor_validate_raw_field "$tteam"; _doctor_validate_raw_field "$tagent"
+  _doctor_validate_raw_field "$tcomp"; _doctor_validate_raw_field "$evidence"
+  _doctor_validate_raw_field "$opaque"
+  local dproj="" dteam="" dagent="" ev=""
+  [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
+  if [ -n "$tkind" ] && [ -n "$tteam" ]; then _redact_team "$tteam"; dteam="$_REDACT_OUT"; fi
+  if [ -n "$tkind" ] && [ -n "$tagent" ]; then _redact_agent "$tagent"; dagent="$_REDACT_OUT"; fi
+  ev="$(_redact_text "$evidence" "$sproj")"
+  _doctor_flat "$code"; code="$_FLAT_OUT"
+  _doctor_flat "$kind"; kind="$_FLAT_OUT"
+  _doctor_flat "$category"; category="$_FLAT_OUT"
+  _doctor_flat "$dproj"; dproj="$_FLAT_OUT"
+  _doctor_flat "$stype"; stype="$_FLAT_OUT"
+  _doctor_flat "$tkind"; tkind="$_FLAT_OUT"
+  _doctor_flat "$dteam"; dteam="$_FLAT_OUT"
+  _doctor_flat "$dagent"; dagent="$_FLAT_OUT"
+  _doctor_flat "$tcomp"; tcomp="$_FLAT_OUT"
+  _doctor_flat "$ev"; ev="$_FLAT_OUT"
+  _doctor_flat "$opaque"; opaque="$_FLAT_OUT"
+  printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
+    "$code" "$kind" "$category" "$dproj" "$stype" \
+    "$tkind" "$dteam" "$dagent" "$tcomp" "$ev" "$opaque" >> "$_DOCTOR_FINDINGS_FILE" || _doctor_fatal "failed to append finding"
+}
+# agmsg_doctor_component_signal <scope_project_raw> <scope_type> <component_id>
+#   <instance_team_raw> <instance_agent_raw> <signal_code> <signal_status> [opaque]
+# Empty instance team/agent and empty opaque means a scope singleton
+# (serialized as null). Non-empty opaque (P1-6) means an opaque global
+# instance (serialized as {"kind":"opaque","id":...}).
+agmsg_doctor_component_signal() {
+  local sproj="${1:-}" stype="${2:-}" comp="${3:-}" iteam="${4:-}" iagent="${5:-}"
+  local scode="${6:-}" sstatus="${7:-}" opaque="${8:-}"
+  _doctor_validate_raw_field "$sproj"; _doctor_validate_raw_field "$stype"
+  _doctor_validate_raw_field "$comp"; _doctor_validate_raw_field "$iteam"
+  _doctor_validate_raw_field "$iagent"; _doctor_validate_raw_field "$scode"
+  _doctor_validate_raw_field "$sstatus"; _doctor_validate_raw_field "$opaque"
+  local dproj="" dteam="" dagent=""
+  [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
+  if [ -n "$iteam" ]; then _redact_team "$iteam"; dteam="$_REDACT_OUT"; fi
+  if [ -n "$iagent" ]; then _redact_agent "$iagent"; dagent="$_REDACT_OUT"; fi
+  _doctor_flat "$dproj"; dproj="$_FLAT_OUT"
+  _doctor_flat "$stype"; stype="$_FLAT_OUT"
+  _doctor_flat "$comp"; comp="$_FLAT_OUT"
+  _doctor_flat "$dteam"; dteam="$_FLAT_OUT"
+  _doctor_flat "$dagent"; dagent="$_FLAT_OUT"
+  _doctor_flat "$scode"; scode="$_FLAT_OUT"
+  _doctor_flat "$sstatus"; sstatus="$_FLAT_OUT"
+  _doctor_flat "$opaque"; opaque="$_FLAT_OUT"
+  printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
+    "$dproj" "$stype" "$comp" "$dteam" "$dagent" "$scode" "$sstatus" "$opaque" >> "$_DOCTOR_COMPS_FILE" || _doctor_fatal "failed to append component signal"
+}
+# Plug display lines for the human block (raw; redacted at render time like
+# the legacy protocol). One stored line per call.
+agmsg_doctor_display_add() {
+  local sproj="${1:-}" stype="${2:-}" line="${3:-}"
+  _doctor_validate_raw_field "$sproj"; _doctor_validate_raw_field "$stype"
+  _doctor_validate_raw_field "$line"
+  local dproj=""
+  [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
+  _doctor_flat "$dproj"; dproj="$_FLAT_OUT"
+  _doctor_flat "$stype"; stype="$_FLAT_OUT"
+  _doctor_flat "$line"; line="$_FLAT_OUT"
+  printf '%s\037%s\037%s\n' "$dproj" "$stype" "$line" >> "$_DOCTOR_DISPLAY_FILE" || _doctor_fatal "failed to append display line"
+}
+agmsg_doctor_global_display_add() {
+  local stype="${1:-}" line="${2:-}"
+  _doctor_validate_raw_field "$stype"; _doctor_validate_raw_field "$line"
+  _doctor_flat "$stype"; stype="$_FLAT_OUT"
+  _doctor_flat "$line"; line="$_FLAT_OUT"
+  printf '%s\037%s\n' "$stype" "$line" >> "$_DOCTOR_GLOBAL_DISPLAY_FILE" || _doctor_fatal "failed to append display line"
+}
+# Render the records one structured plug collection appended (lines after
+# the given 1-based start offsets) into the human report: findings for this
+# scope become project-prefixed warnings, display lines are returned via
+# _RENDERED_PLUG_DISPLAY for the caller to quote into the pair's block.
+# Human mode only -- JSON mode reads the same store files via the serializer.
+# A leading "[...] " scope prefix is NOT re-added here: stored evidence
+# already had it stripped at registration, so the prefix below restores
+# exactly the shape the legacy WARN protocol produced.
+_RENDERED_PLUG_DISPLAY=""
+_doctor_render_plug_store() {
+  local sproj="$1" stype="$2" fstart="$3" dstart="$4" dproj="" sep
+  _redact_project "$sproj"; dproj="$_REDACT_OUT"
+  sep="$(printf '\037')"
+  _RENDERED_PLUG_DISPLAY=""
+  local fcode fkind fcat fsproj fstype ftkind ftteam ftagent ftcomp fev fopaque
+  while IFS="$sep" read -r fcode fkind fcat fsproj fstype ftkind ftteam ftagent ftcomp fev fopaque; do
+    [ -n "$fcode" ] || continue
+    [ "$fsproj" = "$dproj" ] || continue
+    [ "$fstype" = "$stype" ] || continue
+    WARNINGS="${WARNINGS}[$dproj] $fev"$'\n'
+  done <<< "$(tail -n "+$fstart" "$_DOCTOR_FINDINGS_FILE" 2>/dev/null || true)"
+  local ddproj ddtype ddline
+  while IFS="$sep" read -r ddproj ddtype ddline; do
+    [ -n "$ddline" ] || continue
+    [ "$ddproj" = "$dproj" ] || continue
+    [ "$ddtype" = "$stype" ] || continue
+    ddline="$(_redact_text "$ddline" "$sproj")"
+    _RENDERED_PLUG_DISPLAY="${_RENDERED_PLUG_DISPLAY}${_RENDERED_PLUG_DISPLAY:+$'\n'}${ddline}"
+  done <<< "$(tail -n "+$dstart" "$_DOCTOR_DISPLAY_FILE" 2>/dev/null || true)"
+}
+# Global counterpart: findings recorded by one global collection (empty scope
+# project, matching type) become unprefixed warnings; global display lines go
+# to GLOBAL_EXTRA_BLOCKS. Mirrors the legacy global protocol's shapes.
+_doctor_render_global_store() {
+  local stype="$1" fstart="$2" dstart="$3" sep
+  sep="$(printf '\037')"
+  local fcode fkind fcat fsproj fstype ftkind ftteam ftagent ftcomp fev fopaque
+  while IFS="$sep" read -r fcode fkind fcat fsproj fstype ftkind ftteam ftagent ftcomp fev fopaque; do
+    [ -n "$fcode" ] || continue
+    [ -z "$fsproj" ] || continue
+    [ "$fstype" = "$stype" ] || continue
+    WARNINGS="${WARNINGS}${fev}"$'\n'
+  done <<< "$(tail -n "+$fstart" "$_DOCTOR_FINDINGS_FILE" 2>/dev/null || true)"
+  local gdtype gdline
+  while IFS="$sep" read -r gdtype gdline; do
+    [ -n "$gdline" ] || continue
+    [ "$gdtype" = "$stype" ] || continue
+    GLOBAL_EXTRA_BLOCKS="${GLOBAL_EXTRA_BLOCKS}$(_redact_text "$gdline" "")"$'\n'
+  done <<< "$(tail -n "+$dstart" "$_DOCTOR_GLOBAL_DISPLAY_FILE" 2>/dev/null || true)"
+}
+# Per-scope registration observation (core only): lock is none|alive|stale,
+# watcher is running|stale-pidfile|none (empty = not applicable, null).
+_doctor_reg_add() {
+  local sproj="${1:-}" stype="${2:-}" team="${3:-}" agent="${4:-}"
+  local lock="${5:-}" watcher="${6:-}"
+  _doctor_validate_raw_field "$sproj"; _doctor_validate_raw_field "$stype"
+  _doctor_validate_raw_field "$team"; _doctor_validate_raw_field "$agent"
+  _doctor_validate_raw_field "$lock"; _doctor_validate_raw_field "$watcher"
+  local dproj="" dteam="" dagent=""
+  [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
+  _redact_team "$team"; dteam="$_REDACT_OUT"
+  _redact_agent "$agent"; dagent="$_REDACT_OUT"
+  _doctor_flat "$dproj"; dproj="$_FLAT_OUT"
+  _doctor_flat "$stype"; stype="$_FLAT_OUT"
+  _doctor_flat "$dteam"; dteam="$_FLAT_OUT"
+  _doctor_flat "$dagent"; dagent="$_FLAT_OUT"
+  _doctor_flat "$lock"; lock="$_FLAT_OUT"
+  _doctor_flat "$watcher"; watcher="$_FLAT_OUT"
+  printf '%s\037%s\037%s\037%s\037%s\037%s\n' \
+    "$dproj" "$stype" "$dteam" "$dagent" "$lock" "$watcher" >> "$_DOCTOR_REGS_FILE" || _doctor_fatal "failed to append registration"
+}
+# Per-scope delivery observation: status is ok|failed|skipped. The mode line
+# can name the project (the "off (unrecognized: ...)" annotation quotes the
+# settings path it looked for), so it goes through the same redaction as
+# every other human-sourced string -- otherwise --redacted --json would leak
+# the raw path here while masking it everywhere else.
+_doctor_scope_add() {
+  local sproj="${1:-}" stype="${2:-}" mode="${3:-}" dstatus="${4:-}"
+  _doctor_validate_raw_field "$sproj"; _doctor_validate_raw_field "$stype"
+  _doctor_validate_raw_field "$mode"; _doctor_validate_raw_field "$dstatus"
+  local dproj=""
+  [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
+  mode="$(_redact_text "$mode" "$sproj")"
+  _doctor_flat "$dproj"; dproj="$_FLAT_OUT"
+  _doctor_flat "$stype"; stype="$_FLAT_OUT"
+  _doctor_flat "$mode"; mode="$_FLAT_OUT"
+  _doctor_flat "$dstatus"; dstatus="$_FLAT_OUT"
+  printf '%s\037%s\037%s\037%s\n' "$dproj" "$stype" "$mode" "$dstatus" >> "$_DOCTOR_SCOPES_FILE" || _doctor_fatal "failed to append scope"
 }
 
 # --- scan one (project, type) pair, buffer its block ------------------------
@@ -370,7 +784,16 @@ TOTAL_PAIR_COUNT=0
 # run/watch.*.pid stale-watcher detection entirely, not just deduplicate it.
 # Caught in review; the fix is scanning run/ once, unconditionally, not
 # deduplicating a per-pair emission that may never happen.
-GLOBAL_WATCH_LINE="$(bash "$SCRIPT_DIR/delivery.sh" status 2>&1 | grep '^watch processes: ' | head -1 || true)"
+#
+# P1-1 fail-closed: output と rc を分離して取得する。grep パイプで rc を
+# 握り潰さない。nonzero rc は store 初期化後の global 診断で
+# delivery_status_failed (diagnostic_failure) へ正規化し、false healthy
+# (rc0/diagnosable:true) にしない。machine の stale count 自体は
+# evaluator (P1-4) から取得し、この human text を parse しない。
+GLOBAL_DELIVERY_RC=0
+GLOBAL_DELIVERY_OUTPUT=""
+GLOBAL_DELIVERY_OUTPUT="$(bash "$SCRIPT_DIR/delivery.sh" status 2>&1)" || GLOBAL_DELIVERY_RC=$?
+GLOBAL_WATCH_LINE="$(printf '%s\n' "$GLOBAL_DELIVERY_OUTPUT" | grep '^watch processes: ' | head -1 || true)"
 _doctor_scan_pair() {
   local project="$1" type="$2"
 
@@ -410,21 +833,37 @@ _doctor_scan_pair() {
   done
   unset _dm_tok
 
-  # Shelled out to the real CLI (not sourced): delivery.sh dispatches on argv
-  # at file scope, so sourcing it would run that dispatch. Reused verbatim
-  # (through _redact_text) -- the type-specific per-role bridge liveness
-  # this project already has (codex's _delivery.sh) is not worth a second
-  # implementation here. Trade-off: MODE and the stale-pidfile warnings
-  # below are parsed out of this human-readable text, so if delivery.sh's
-  # wording changes, both go silent (no warning, not a wrong one) rather
-  # than erroring -- a duplicated implementation would drift instead of
-  # going quiet, which is worse. Flagged here so whoever next changes
-  # delivery.sh's status wording knows to check.
-  local delivery_status=0 delivery_output="" mode_line="" mode="off"
+  # delivery 観測は shared evaluator が SSOT (P1-4): doctor は human text を
+  # grep/sed して machine field/finding へ変換しない。human 表示用の
+  # delivery_output (delivery.sh status の verbatim) と machine 用の
+  # evaluator 結果は分離して取得する。human wording 変更だけでは machine
+  # JSON は壊れない。delivery.sh 自体の失敗と evaluator 失敗のいずれも
+  # delivery_status_failed (diagnostic_failure) へ正規化する。
+  # stdout purity (P1-2): evaluator/plug/collector/subprocess の stdout は
+  # 最終 stdout へ直接流さない。delivery.sh 呼び出しは $() 捕捉済みであり、
+  # plug source/collector は 1>&2 で stderr へ逃がす (後述)。
+  local delivery_status=0 delivery_output="" mode="off" eval_ok=1
+  local eval_stale=0 eval_stale_ok=1
   if [ "$type_has_delivery" -eq 1 ]; then
+    # Machine: mode は evaluator から直接取得 (human text parse 禁止)。
+    # stdout 隔離 (1>&2): evaluator/helper の stdout が最終 stdout へ直接
+    # 流れないよう stderr へ逃がす。machine evaluator は stdout を contract
+    # にしないため、noise があっても JSON を汚さない。
+    if agmsg_delivery_eval_mode "$type" "$project" 1>&2 2>/dev/null; then
+      mode="$AGMSG_DELIVERY_EVAL_MODE"
+    else
+      eval_ok=0
+      mode="off"
+    fi
+    # Machine: scoped stale は evaluator から直接取得 (human text parse 禁止)。
+    if agmsg_delivery_eval_scoped_stale "$type" "$project" 1>&2 2>/dev/null; then
+      eval_stale="$AGMSG_DELIVERY_EVAL_SCOPED_STALE"
+    else
+      eval_stale_ok=0
+      eval_stale=0
+    fi
+    # Human display: delivery.sh status の verbatim (machine には使わない)。
     delivery_output="$(bash "$SCRIPT_DIR/delivery.sh" status "$type" "$project" 2>&1)" || delivery_status=$?
-    mode_line="$(printf '%s\n' "$delivery_output" | head -1)"
-    mode="${mode_line#mode: }"
 
     # This pair's own delivery.sh call may ALSO emit the same global line
     # (default runtime status, when this type doesn't override it) -- always
@@ -434,7 +873,16 @@ _doctor_scan_pair() {
     # (do_status runs agmsg_delivery_status first, unconditionally), so this
     # grep -v never filters every line away in practice -- guarded with
     # || true anyway rather than leaning on that ordering under set -e.
+    # NOTE: この grep -v は human 表示整形のみに用い、machine 判定には
+    # 使わない (P1-4)。
     delivery_output="$(printf '%s\n' "$delivery_output" | grep -v '^watch processes: ' || true)"
+  else
+    # No-delivery type (off のみ): evaluator から off を取得する。
+    if agmsg_delivery_eval_mode "$type" "$project" 1>&2 2>/dev/null; then
+      mode="$AGMSG_DELIVERY_EVAL_MODE"
+    else
+      mode="off"
+    fi
   fi
 
   # Tracks whether this pair turned out to have anything worth a full block:
@@ -448,7 +896,20 @@ _doctor_scan_pair() {
   _warn_count_before="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
 
   local pairs pair_count reg_lines="" first_team="" first_agent="" _any_owner=0
-  pairs="$("$SCRIPT_DIR/identities.sh" "$project" "$type")"
+  # P1-2: identities 失敗は silent にしない。per-scope partial として
+  # scan_failed (diagnostic_failure) へ正規化し、scope 記録を残して継続
+  # する (serializer の orphan child 厳格化のため scope entry は必須)。
+  # ERR trap による全体 rc2 ではなく partial rc1 を優先する。
+  local _ident_rc=0
+  pairs="$("$SCRIPT_DIR/identities.sh" "$project" "$type" 2>/dev/null)" || _ident_rc=$?
+  if [ "$_ident_rc" -ne 0 ]; then
+    _redact_project "$project"
+    _doctor_warn scan_failed diagnostic_failure unknown "$project" "$type" \
+      "" "" "" "" -- \
+      "[$_REDACT_OUT] identities lookup failed for this scope (rc $_ident_rc); structured observations may be incomplete"
+    _doctor_scope_add "$project" "$type" "$mode" "failed"
+    return 0
+  fi
   # FILTER_TEAM, when set, narrows the report to that team's own rows -- a
   # pair SCOPE already guaranteed has at least one registration for that
   # team (see the --project branch above / agmsg_registered_projects's team
@@ -470,6 +931,7 @@ _doctor_scan_pair() {
 
       if [ -z "$owner" ]; then
         reg_lines="${reg_lines}$(printf '  %-22s lock=none' "$dteam/$dagent")"$'\n'
+        _doctor_reg_add "$project" "$type" "$team" "$agent" "none" ""
         continue
       fi
       _any_owner=1
@@ -479,7 +941,9 @@ _doctor_scan_pair() {
       else
         alive_word="STALE"
         _redact_project "$project"
-        _warn "[$_REDACT_OUT] stale lock: $dteam/$dagent (owner=$(_redact_owner "$owner"))"
+        _doctor_warn lock_stale condition messaging "$project" "$type" \
+          registration "$team" "$agent" "" -- \
+          "[$_REDACT_OUT] stale lock: $dteam/$dagent (owner=$(_redact_owner "$owner"))"
       fi
 
       cc_note=""
@@ -498,17 +962,21 @@ _doctor_scan_pair() {
       # of its own: reuses _agmsg_pid_alive_local, the same helper
       # delivery.sh's own default runtime status calls.
       watcher_note=""
+      watcher_val=""
       if [ "$type_has_role_runtime" -eq 0 ]; then
         wpidfile="$RUN_DIR/watch.$owner.pid"
         if [ -f "$wpidfile" ]; then
           wpid="$(cat "$wpidfile" 2>/dev/null || true)"
           if [ -n "$wpid" ] && _agmsg_pid_alive_local "$wpid" 2>/dev/null; then
             watcher_note=" watcher=running"
+            watcher_val="running"
           else
             watcher_note=" watcher=stale-pidfile"
+            watcher_val="stale-pidfile"
           fi
         else
           watcher_note=" watcher=none"
+          watcher_val="none"
           # Only when the lock itself is legitimately live: a stale lock
           # having no watcher is unremarkable (already covered above), but
           # an alive lock with no watcher means the role claims exclusivity
@@ -516,9 +984,16 @@ _doctor_scan_pair() {
           # both were.
           if [ "$alive_word" = "alive" ]; then
             _redact_project "$project"
-            _warn "[$_REDACT_OUT] actas lock held but no watcher: $dteam/$dagent (owner=$(_redact_owner "$owner"))"
+            _doctor_warn lock_no_watcher condition messaging "$project" "$type" \
+              registration "$team" "$agent" "" -- \
+              "[$_REDACT_OUT] actas lock held but no watcher: $dteam/$dagent (owner=$(_redact_owner "$owner"))"
           fi
         fi
+      fi
+      if [ "$alive_word" = "alive" ]; then
+        _doctor_reg_add "$project" "$type" "$team" "$agent" "alive" "$watcher_val"
+      else
+        _doctor_reg_add "$project" "$type" "$team" "$agent" "stale" "$watcher_val"
       fi
 
       reg_lines="${reg_lines}$(printf '  %-22s lock=owner(%s)=%s%s%s' "$dteam/$dagent" "$alive_word" "$(_redact_owner "$owner")" "$cc_note" "$watcher_note")"$'\n'
@@ -528,67 +1003,149 @@ _doctor_scan_pair() {
       _redact_team "$first_team"; first_dteam="$_REDACT_OUT"
       _redact_agent "$first_agent"; first_dagent="$_REDACT_OUT"
       _redact_project "$project"
-      _warn "[$_REDACT_OUT] $pair_count registrations for this (project, type) under turn-mode delivery -- only the first registered ($first_dteam/$first_dagent) receives Stop-hook delivery; the rest are silent under turn"
+      _doctor_warn turn_mode_multi_registration condition messaging "$project" "$type" \
+        "" "" "" "" -- \
+        "[$_REDACT_OUT] $pair_count registrations for this (project, type) under turn-mode delivery -- only the first registered ($first_dteam/$first_dagent) receives Stop-hook delivery; the rest are silent under turn"
     fi
   fi
 
-  # codex's per-role lines always carry a parenthetical reason (e.g. "stale
-  # pidfile (pid 123 not running)") -- a genuine per-(project, type) fact,
-  # unlike the installation-wide "N stale pidfiles" default-runtime-status
-  # line (captured independently into GLOBAL_WATCH_LINE above and checked
-  # once, globally, after the whole scope has been scanned -- see below the
-  # scan loop).
-  if printf '%s\n' "$delivery_output" | grep -q "stale pidfile ("; then
+  # Scoped stale は shared evaluator が SSOT (P1-4): human text の
+  # "stale pidfile (" を grep しない。wording 変更では machine JSON は
+  # 壊れない。
+  if [ "$eval_stale" = "1" ]; then
     _redact_project "$project"
-    _warn "[$_REDACT_OUT] watcher/bridge pidfile present but process not running (see delivery status above)"
+    _doctor_warn watcher_stale_pidfile condition runtime "$project" "$type" \
+      "" "" "" "" -- \
+      "[$_REDACT_OUT] watcher/bridge pidfile present but process not running (see delivery status above)"
   fi
 
   # Type-specific extra diagnosis. A plug at
-  # scripts/drivers/types/<type>/_doctor.sh may define
-  # agmsg_doctor_extra_status <type> <project>: its stdout is quoted into this
-  # pair's block (redacted below together with everything else), except lines
-  # starting with "WARN: ", which become warnings instead (prefix stripped,
-  # project-prefixed like every other warning here). Only codex ships such a
-  # plug today (app-server pid/port/version + bridge binding state, #5);
-  # every other type skips this with one file-exists check. Sourced, not
-  # shelled out, so the plug reuses this script's own helpers (liveness,
-  # cmdline, redaction tables) instead of recomputing them; the plug's own
-  # double-source guard makes re-sourcing once per pair a no-op after the
-  # first. Read-only by contract: a plug never kills, removes, or restarts
-  # anything — stale or foreign state is reported, not cleaned up.
+  # scripts/drivers/types/<type>/_doctor.sh may define the structured
+  # collector entry point agmsg_doctor_extra_collect <type> <project>
+  # (Issue #8): it registers findings / component signals / display lines
+  # directly through the collector API above -- no stdout protocol, nothing
+  # reparsed. The human WARN lines and the --json findings below are both
+  # rendered from that one store, so the two outputs cannot disagree about
+  # what was observed. Only codex ships such a plug today (app-server
+  # pid/port/version + bridge binding state, #5); every other type skips
+  # this with one file-exists check. Sourced, not shelled out, so the plug
+  # reuses this script's own helpers (liveness, cmdline, redaction tables)
+  # instead of recomputing them; the plug's own double-source guard makes
+  # re-sourcing once per pair a no-op after the first. Read-only by
+  # contract: a plug never kills, removes, or restarts anything — stale or
+  # foreign state is reported, not cleaned up.
+  #
+  # A plug file WITHOUT the structured entry point is legacy: human mode
+  # keeps the old agmsg_doctor_extra_status stdout protocol (WARN:-prefixed
+  # lines become warnings, the rest is quoted into the block), while --json
+  # mode refuses to guess codes from that text and records a
+  # legacy_plug_unstructured diagnostic_failure instead (fail-closed).
   _extra_plug="$SKILL_DIR/scripts/drivers/types/$type/_doctor.sh"
+  _extra_has_collect=0
   if [ -f "$_extra_plug" ]; then
+    if grep -q '^agmsg_doctor_extra_collect()' "$_extra_plug" 2>/dev/null; then
+      _extra_has_collect=1
+    fi
+  fi
+  if [ "$_extra_has_collect" -eq 1 ]; then
+    # P1-2 stdout purity: plug source の stdout が最終 stdout へ直接流れ
+    # ないよう 1>&2 へ逃がす。source 不正/失敗は silent にせず
+    # plug_collector_failed (diagnostic_failure) へ正規化する。
+    _plug_src_rc=0
     # shellcheck disable=SC1091
-    . "$_extra_plug" 2>/dev/null || true
-    if command -v agmsg_doctor_extra_status >/dev/null 2>&1; then
-      _extra_output="$(agmsg_doctor_extra_status "$type" "$project" 2>/dev/null || true)"
-      _extra_warns="$(printf '%s\n' "$_extra_output" | grep '^WARN: ' | sed 's/^WARN: //' || true)"
-      if [ -n "$_extra_warns" ]; then
-        while IFS= read -r _extra_warn; do
-          [ -n "$_extra_warn" ] || continue
-          _extra_warn_red="$(_redact_text "$_extra_warn" "$project")"
-          _redact_project "$project"
-          _warn "[$_REDACT_OUT] $_extra_warn_red"
-        done <<< "$_extra_warns" || true
+    . "$_extra_plug" 1>&2 2>/dev/null || _plug_src_rc=$?
+    if [ "$_plug_src_rc" -ne 0 ]; then
+      agmsg_doctor_finding_add plug_collector_failed diagnostic_failure unknown \
+        "$project" "$type" "" "" "" "" \
+        "type plug source for '$type' exited $_plug_src_rc during this scope's scan; structured observations for this scope may be incomplete" ""
+      if [ "$JSON_MODE" -eq 0 ]; then
+        # Human 側にも警告として出すため、store から描画する。
+        _plug_fmark="$(wc -l < "$_DOCTOR_FINDINGS_FILE" 2>/dev/null | tr -d ' ')"
+        _plug_dmark="$(wc -l < "$_DOCTOR_DISPLAY_FILE" 2>/dev/null | tr -d ' ')"
+        _doctor_render_plug_store "$project" "$type" "$((_plug_fmark))" "$((_plug_dmark + 1))"
       fi
-      _extra_display="$(printf '%s\n' "$_extra_output" | grep -v '^WARN: ' || true)"
-      if [ -n "$_extra_display" ]; then
-        delivery_output="${delivery_output}${delivery_output:+$'\n'}${_extra_display}"
+    else
+      # Called directly in this shell (never inside $()): findings and display
+      # lines land in the store files, not on stdout. Stdout is redirected to
+      # stderr so a stray plug print can never pollute the --json payload (or
+      # silently vanish from the human report); by contract the plug prints
+      # nothing there. A nonzero collector exit is captured, never left to
+      # trip set -e mid-scan (which would end the run with rc 1 and an empty
+      # stdout, violating the exit contract): the scope keeps whatever else
+      # was observed and records a plug_collector_failed diagnostic_failure.
+      _plug_fmark="$(wc -l < "$_DOCTOR_FINDINGS_FILE" | tr -d ' ')"
+      _plug_dmark="$(wc -l < "$_DOCTOR_DISPLAY_FILE" | tr -d ' ')"
+      _plug_collector_rc=0
+      agmsg_doctor_extra_collect "$type" "$project" 1>&2 || _plug_collector_rc=$?
+      if [ "$_plug_collector_rc" -ne 0 ]; then
+        agmsg_doctor_finding_add plug_collector_failed diagnostic_failure unknown \
+          "$project" "$type" "" "" "" "" \
+          "type plug collector for '$type' exited $_plug_collector_rc during this scope's scan; structured observations for this scope may be incomplete" ""
+      fi
+      if [ "$JSON_MODE" -eq 0 ]; then
+        _doctor_render_plug_store "$project" "$type" "$((_plug_fmark + 1))" "$((_plug_dmark + 1))"
+        if [ -n "$_RENDERED_PLUG_DISPLAY" ]; then
+          delivery_output="${delivery_output}${delivery_output:+$'\n'}${_RENDERED_PLUG_DISPLAY}"
+        fi
+      fi
+    fi
+  elif [ -f "$_extra_plug" ]; then
+    if [ "$JSON_MODE" -eq 1 ]; then
+      _redact_project "$project"
+      _doctor_warn legacy_plug_unstructured diagnostic_failure unknown "$project" "$type" \
+        "" "" "" "" -- \
+        "[$_REDACT_OUT] type plug has no structured collector; this scope cannot be fully diagnosed in machine-readable mode"
+    else
+      # P1-2: source stdout purity (1>&2) と rc 捕捉。legacy human path
+      # でも source 失敗を silent にしない。
+      _plug_src_rc=0
+      # shellcheck disable=SC1091
+      . "$_extra_plug" 1>&2 2>/dev/null || _plug_src_rc=$?
+      if [ "$_plug_src_rc" -ne 0 ]; then
+        _redact_project "$project"
+        _warn "[$_REDACT_OUT] type plug source for '$type' exited $_plug_src_rc"
+      elif command -v agmsg_doctor_extra_status >/dev/null 2>&1; then
+        _extra_output="$(agmsg_doctor_extra_status "$type" "$project" 2>/dev/null || true)"
+        _extra_warns="$(printf '%s\n' "$_extra_output" | grep '^WARN: ' | sed 's/^WARN: //' || true)"
+        if [ -n "$_extra_warns" ]; then
+          while IFS= read -r _extra_warn; do
+            [ -n "$_extra_warn" ] || continue
+            _extra_warn_red="$(_redact_text "$_extra_warn" "$project")"
+            _redact_project "$project"
+            _warn "[$_REDACT_OUT] $_extra_warn_red"
+          done <<< "$_extra_warns" || true
+        fi
+        _extra_display="$(printf '%s\n' "$_extra_output" | grep -v '^WARN: ' || true)"
+        if [ -n "$_extra_display" ]; then
+          delivery_output="${delivery_output}${delivery_output:+$'\n'}${_extra_display}"
+        fi
       fi
     fi
   fi
-  unset _extra_plug _extra_output _extra_warns _extra_warn _extra_warn_red _extra_display
+  unset _extra_plug _extra_has_collect _plug_fmark _plug_dmark _plug_collector_rc _plug_src_rc _extra_output _extra_warns _extra_warn _extra_warn_red _extra_display
 
   # type is already validated (or came from the registry) before this is
   # ever called, so this is not the "unknown type" case -- some other
-  # failure inside delivery.sh status itself. Surfaced as a warning rather
+  # failure inside delivery evaluation itself (delivery.sh status rc,
+  # shared evaluator mode/stale evaluation). Surfaced as a warning rather
   # than swallowed: showing error text on screen while still reporting
   # "no warnings." / exit 0 underneath would be a doctor that lies about
-  # its own read. type_has_delivery gates this call happening at all now, so
-  # this can only fire for a type that DOES have delivery to query.
-  if [ "$delivery_status" -ne 0 ]; then
+  # its own read. type_has_delivery gates the delivery.sh call happening at
+  # all now, so the delivery_status branch can only fire for a type that
+  # DOES have delivery to query; evaluator failures are type-independent.
+  # P1-1/P1-4: 既存 delivery_status_failed を再利用し、新 code を増やさない。
+  if [ "$delivery_status" -ne 0 ] || [ "$eval_ok" -eq 0 ] || [ "$eval_stale_ok" -eq 0 ]; then
     _redact_project "$project"
-    _warn "[$_REDACT_OUT] delivery.sh status exited $delivery_status (see delivery status above)"
+    _doctor_warn delivery_status_failed diagnostic_failure runtime "$project" "$type" \
+      "" "" "" "" -- \
+      "[$_REDACT_OUT] delivery.sh status exited $delivery_status (see delivery status above)"
+  fi
+  if [ "$type_has_delivery" -eq 0 ]; then
+    _doctor_scope_add "$project" "$type" "$mode" "skipped"
+  elif [ "$delivery_status" -ne 0 ] || [ "$eval_ok" -eq 0 ] || [ "$eval_stale_ok" -eq 0 ]; then
+    _doctor_scope_add "$project" "$type" "$mode" "failed"
+  else
+    _doctor_scope_add "$project" "$type" "$mode" "ok"
   fi
 
   # "Nothing to report": no lock held (by anyone), no warning raised while
@@ -666,6 +1223,8 @@ _doctor_scan_pair() {
 # pair, instead of querying it twice.
 DISTINCT_TEAMS=""
 SCANNED_TYPES=""
+_doctor_store_init
+trap 'rm -rf "${_DOCTOR_TMP:-}"' EXIT INT TERM
 while IFS=$'\t' read -r _proj _type; do
   [ -z "$_proj" ] && continue
   _doctor_scan_pair "$_proj" "$_type"
@@ -683,17 +1242,31 @@ while IFS=$'\t' read -r _proj _type; do
 done <<< "$SCOPE"
 TEAM_COUNT="$(printf '%s\n' "$DISTINCT_TEAMS" | grep -c . || true)"
 
-# GLOBAL_WATCH_LINE's own stale-pidfile count is an installation-wide fact
-# (see where it's captured in _doctor_scan_pair) -- checked here, ONCE, for
-# the whole run, rather than once per pair scanned. Reuses the exact same
-# text the per-pair codex check above parses a different (per-role) line
-# from; this just applies that same parsing to the one line that is global.
-if [ -n "$GLOBAL_WATCH_LINE" ]; then
-  GLOBAL_STALE_COUNT="$(printf '%s\n' "$GLOBAL_WATCH_LINE" | sed -n 's/.*, \([0-9]*\) stale pidfiles*$/\1/p')"
-  case "$GLOBAL_STALE_COUNT" in ''|*[!0-9]*) GLOBAL_STALE_COUNT=0 ;; esac
-  if [ "$GLOBAL_STALE_COUNT" -gt 0 ]; then
-    _warn "watcher pidfile present but process not running, installation-wide (see the 'watch processes' line above)"
+# P1-1 fail-closed: global delivery.sh status nonzero を握り潰さない。
+# meaningful partial report が可能なため rc1 + JSON (diagnosable:false +
+# diagnostic_failure) とし、authoritative report 自体が生成不能な場合のみ
+# rc2 (ERR trap / serializer rc2 path) とする。既存 delivery_status_failed
+# を global にも再利用する。
+if [ "${GLOBAL_DELIVERY_RC:-0}" -ne 0 ]; then
+  _doctor_warn delivery_status_failed diagnostic_failure runtime "" "" \
+    "" "" "" "" -- \
+    "installation-wide delivery status failed (rc $GLOBAL_DELIVERY_RC)"
+fi
+
+# Global watcher stale は shared evaluator が SSOT (P1-4): human text の
+# GLOBAL_WATCH_LINE を sed して machine count へ変換しない。human 表示は
+# GLOBAL_WATCH_LINE をそのまま使い、machine 判定は evaluator の counts を
+# 直接使う。wording 変更では JSON は壊れない。
+if agmsg_delivery_eval_watchers 1>&2 2>/dev/null; then
+  if [ "${AGMSG_DELIVERY_EVAL_WATCH_STALE:-0}" -gt 0 ]; then
+    _doctor_warn watcher_stale_pidfile_global condition runtime "" "" \
+      "" "" "" "" -- \
+      "watcher pidfile present but process not running, installation-wide (see the 'watch processes' line above)"
   fi
+else
+  _doctor_warn delivery_status_failed diagnostic_failure runtime "" "" \
+    "" "" "" "" -- \
+    "installation-wide watcher evaluation failed; installation-wide observations may be incomplete"
 fi
 
 # Installation-wide type-plug diagnosis, once per run rather than per pair:
@@ -731,27 +1304,115 @@ if [ -z "$FILTER_PROJECT" ]; then
     [ -n "$_extra_type" ] || continue
     _extra_plug="$SKILL_DIR/scripts/drivers/types/$_extra_type/_doctor.sh"
     [ -f "$_extra_plug" ] || continue
-    # shellcheck disable=SC1091
-    . "$_extra_plug" 2>/dev/null || true
-    if command -v agmsg_doctor_extra_global >/dev/null 2>&1; then
-      _extra_output="$(agmsg_doctor_extra_global "$_extra_type" 2>/dev/null || true)"
-      _extra_warns="$(printf '%s\n' "$_extra_output" | grep '^WARN: ' | sed 's/^WARN: //' || true)"
-      if [ -n "$_extra_warns" ]; then
-        while IFS= read -r _extra_warn; do
-          [ -n "$_extra_warn" ] || continue
-          _warn "$(_redact_text "$_extra_warn" "")"
-        done <<< "$_extra_warns" || true
+    if grep -q '^agmsg_doctor_extra_global_collect()' "$_extra_plug" 2>/dev/null; then
+      # P1-2: source stdout purity (1>&2) と rc 捕捉。source 失敗は
+      # plug_collector_failed へ正規化し silent にしない。
+      _plug_gsrc_rc=0
+      # shellcheck disable=SC1091
+      . "$_extra_plug" 1>&2 2>/dev/null || _plug_gsrc_rc=$?
+      if [ "$_plug_gsrc_rc" -ne 0 ]; then
+        agmsg_doctor_finding_add plug_collector_failed diagnostic_failure unknown \
+          "" "$_extra_type" "" "" "" "" \
+          "type plug global source for '$_extra_type' exited $_plug_gsrc_rc; installation-wide observations may be incomplete" ""
+      else
+        _plug_gfmark="$(wc -l < "$_DOCTOR_FINDINGS_FILE" | tr -d ' ')"
+        _plug_gdmark="$(wc -l < "$_DOCTOR_GLOBAL_DISPLAY_FILE" | tr -d ' ')"
+        # Same nonzero capture as the per-pair collector above: a failing
+        # global collector degrades to a diagnostic_failure finding, never to
+        # an aborted run with an empty stdout.
+        _plug_gcollector_rc=0
+        agmsg_doctor_extra_global_collect "$_extra_type" 1>&2 || _plug_gcollector_rc=$?
+        if [ "$_plug_gcollector_rc" -ne 0 ]; then
+          agmsg_doctor_finding_add plug_collector_failed diagnostic_failure unknown \
+            "" "$_extra_type" "" "" "" "" \
+            "type plug global collector for '$_extra_type' exited $_plug_gcollector_rc; installation-wide observations may be incomplete" ""
+        fi
+        if [ "$JSON_MODE" -eq 0 ]; then
+          _doctor_render_global_store "$_extra_type" "$((_plug_gfmark + 1))" "$((_plug_gdmark + 1))"
+        fi
       fi
-      _extra_display="$(printf '%s\n' "$_extra_output" | grep -v '^WARN: ' || true)"
-      if [ -n "$_extra_display" ]; then
-        GLOBAL_EXTRA_BLOCKS="${GLOBAL_EXTRA_BLOCKS}$(_redact_text "$_extra_display" "")"$'\n'
+    elif [ "$JSON_MODE" -eq 1 ]; then
+      agmsg_doctor_finding_add legacy_plug_unstructured diagnostic_failure unknown \
+        "" "$_extra_type" "" "" "" "" \
+        "type plug for '$_extra_type' has no structured collector; installation-wide state cannot be fully diagnosed in machine-readable mode"
+    else
+      # P1-2: legacy human path でも source stdout purity と rc 捕捉。
+      _plug_gsrc_rc=0
+      # shellcheck disable=SC1091
+      . "$_extra_plug" 1>&2 2>/dev/null || _plug_gsrc_rc=$?
+      if [ "$_plug_gsrc_rc" -ne 0 ]; then
+        _warn "type plug global source for '$_extra_type' exited $_plug_gsrc_rc"
+      elif command -v agmsg_doctor_extra_global >/dev/null 2>&1; then
+        _extra_output="$(agmsg_doctor_extra_global "$_extra_type" 2>/dev/null || true)"
+        _extra_warns="$(printf '%s\n' "$_extra_output" | grep '^WARN: ' | sed 's/^WARN: //' || true)"
+        if [ -n "$_extra_warns" ]; then
+          while IFS= read -r _extra_warn; do
+            [ -n "$_extra_warn" ] || continue
+            _warn "$(_redact_text "$_extra_warn" "")"
+          done <<< "$_extra_warns" || true
+        fi
+        _extra_display="$(printf '%s\n' "$_extra_output" | grep -v '^WARN: ' || true)"
+        if [ -n "$_extra_display" ]; then
+          GLOBAL_EXTRA_BLOCKS="${GLOBAL_EXTRA_BLOCKS}$(_redact_text "$_extra_display" "")"$'\n'
+        fi
       fi
     fi
   done <<< "$GLOBAL_PLUG_TYPES" || true
 fi
 unset _extra_type _extra_plug _extra_output _extra_warns _extra_warn _extra_display
-unset _plug_path _plug_type GLOBAL_PLUG_TYPES
+unset _plug_path _plug_type _plug_gfmark _plug_gdmark _plug_gcollector_rc _plug_gsrc_rc GLOBAL_PLUG_TYPES GLOBAL_DELIVERY_RC GLOBAL_DELIVERY_OUTPUT
 WARN_COUNT="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
+
+# --json: the scan above collected everything into the store; serialize it
+# as the ONLY stdout payload (Issue #8 strict stdout contract). rc 0/1
+# always carry parseable JSON; rc 2 paths exit before this point with stdout
+# empty and human text on stderr. Requested-scope echo uses the same
+# pseudonym tables, so --redacted --json agrees with the human report.
+if [ "$JSON_MODE" -eq 1 ]; then
+  _json_filter_project=""
+  _json_filter_team=""
+  if [ -n "$FILTER_PROJECT" ]; then
+    _redact_project "$FILTER_PROJECT"; _json_filter_project="$_REDACT_OUT"
+  fi
+  if [ -n "$FILTER_TEAM" ]; then
+    _redact_team "$FILTER_TEAM"; _json_filter_team="$_REDACT_OUT"
+  fi
+  if python3 "$SCRIPT_DIR/internal/doctor-json.py" \
+    --scopes "$_DOCTOR_SCOPES_FILE" \
+    --registrations "$_DOCTOR_REGS_FILE" \
+    --components "$_DOCTOR_COMPS_FILE" \
+    --findings "$_DOCTOR_FINDINGS_FILE" \
+    --filter-project "$_json_filter_project" \
+    --filter-type "$FILTER_TYPE" \
+    --filter-team "$_json_filter_team" \
+    --teams "$TEAM_COUNT" >"$_DOCTOR_TMP/serializer-out.json" 2>"$_DOCTOR_TMP/serializer-err.txt"; then
+    _json_rc=0
+  else
+    _json_rc=$?
+  fi
+  # Publish boundary: serializer の stdout を直接最終 stdout へ出さず、
+  # temp へ出して rc/output を検証してから初めて publish する。serializer
+  # process の起動失敗・初期化失敗 (例: broken PYTHONIOENCODING) は
+  # Python 側が rc 1 で stdout 空になり得るため、そのまま返すと rc1/empty
+  # stdout の契約違反になる。rc 0/1 かつ valid JSON のときのみ publish し、
+  # それ以外は rc2・stdout 空へ正規化する。validator 用 python3 自体が
+  # 壊れている場合も validation 失敗として rc2 になる (正しい)。
+  if { [ "$_json_rc" -eq 0 ] || [ "$_json_rc" -eq 1 ]; } \
+    && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+      "$_DOCTOR_TMP/serializer-out.json" 2>/dev/null; then
+    cat "$_DOCTOR_TMP/serializer-out.json" || _doctor_fatal "failed to publish machine-readable report"
+    exit "$_json_rc"
+  else
+    # serializer の stderr (concise 診断) があれば引き継ぐ。なければ
+    # 汎用メッセージを出す。stdout には何も出さない。
+    if [ -s "$_DOCTOR_TMP/serializer-err.txt" ]; then
+      cat "$_DOCTOR_TMP/serializer-err.txt" >&2 || true
+    else
+      printf 'doctor: serializer failed (rc %s)\n' "$_json_rc" >&2
+    fi
+    exit 2
+  fi
+fi
 
 echo "$TEAM_COUNT team(s), $TOTAL_PAIR_COUNT registration(s), $WARN_COUNT warning(s)"
 echo

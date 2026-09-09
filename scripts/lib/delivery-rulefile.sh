@@ -37,11 +37,21 @@ EOF
   esac
 }
 
-# Status for rule-file types: the rule file's presence is the whole state —
-# present means turn-mode is active, absent means off (no monitor for these).
+# Status for rule-file types: mode 判定は共有 evaluator が SSOT であり、
+# human renderer は描画のみを行う (P1-4)。doctor も同一 evaluator を直接
+# 呼ぶため wording 変更では machine JSON は壊れない。
 rulefile_status() {
   local type="$1" project="$2"
-  local rule_file
-  rule_file="$(resolve_hooks_file "$type" "$project")"
-  if [ -f "$rule_file" ]; then echo "mode: turn"; else echo "mode: off"; fi
+  # evaluator が delivery-eval.sh 未 load の古い sourcing 順でも動くよう
+  # 最低限の fallback を残すが、通常は evaluator が mode を返す。
+  if command -v agmsg_delivery_eval_mode >/dev/null 2>&1; then
+    local mode=""
+    agmsg_delivery_eval_mode "$type" "$project" || return 1
+    mode="$AGMSG_DELIVERY_EVAL_MODE"
+    echo "mode: $mode"
+  else
+    local rule_file
+    rule_file="$(resolve_hooks_file "$type" "$project")"
+    if [ -f "$rule_file" ]; then echo "mode: turn"; else echo "mode: off"; fi
+  fi
 }

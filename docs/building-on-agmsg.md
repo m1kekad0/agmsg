@@ -71,6 +71,80 @@ only sanctioned way to mutate agmsg state; nothing outside `scripts/` should
 write to `db/` or `teams/` directly, for the same forward-compatibility
 reason reads go through `api.sh`.
 
+## Diagnostics: `scripts/doctor.sh --json`
+
+```sh
+~/.agents/skills/<cmd>/scripts/doctor.sh --json [--project <path>] [--type <type>] [--team <team>] [--redacted]
+```
+
+`doctor.sh` without `--json` prints a human-readable report. With `--json`
+it prints a single machine-readable JSON payload (`schema_version: 1`) on
+stdout and nothing else — both are drawn from the same structured
+observations collected during the scan, so they never disagree. Never parse
+the human text; consume the JSON:
+
+- `scope`: the requested filters (`project`/`type`/`team`, null when unfiltered).
+- `summary`: `teams` / `registrations` / `scopes` / `findings` counts.
+- `diagnosable`: top-level rollup — true only when global diagnosis is
+  complete and every scope is fully diagnosable. Each `scopes[]` entry
+  carries its own `diagnosable`: a partially diagnosable installation still
+  reports the healthy scopes instead of failing the whole run.
+- `scopes[]`: per `(project, type)` — `registrations` (lock/watcher state),
+  `delivery` (mode + ok/failed/skipped), type-specific `components` with
+  observation `signals`, and `findings`. Every `scopes[]` entry has a
+  non-empty `project`.
+- `global_components`: installation-wide type components (e.g. unattributed
+  Codex bridge bindings, orphan app-servers), each carrying its own `type`
+  alongside `id`, `instance`, and `signals`. Multiple underlying instances
+  sharing one `id` are distinct entries with distinct opaque `instance`
+  identifiers (never grouped into one null-instance component).
+- `global_findings`: installation-wide findings (scope `project: null`,
+  `type` kept when it belongs to one type).
+
+Scoped vs installation-wide is classified by project presence only: a
+record with a project belongs to that scope; a record without one is
+global. Global records never synthesize a fake empty-project scope, and
+never inflate `summary.scopes`.
+
+Findings carry a stable snake_case `code` (e.g. `lock_stale`,
+`codex_version_drift`, `legacy_plug_unstructured`, `plug_collector_failed`,
+`scan_failed`, `delivery_status_failed` — the latter also covers
+installation-wide delivery evaluation failures), a `kind` (`condition` = noteworthy state observed,
+`diagnostic_failure` = that range could not be fully diagnosed), an advisory
+`category` (`messaging` | `runtime` | `unknown`), a structured `target`
+(registration / component / null for scope-wide), and human-readable
+`evidence`. Component `target` instances are registration references,
+scope-singleton nulls, or opaque references (`{"kind":"opaque","id":...}`,
+e.g. `global_instance1` for orphan/unattributed globals — same raw key maps
+to the same opaque ID within one invocation, distinct keys map to distinct
+IDs). Components carry observation `signals` only — never a health
+verdict, and never raw PIDs, hashes, URLs, sockets, or file paths (those stay in
+redacted `evidence`). Human delivery text is never parsed into machine
+fields: delivery mode/watcher/stale observations come from the shared
+delivery evaluator used by both the human renderer and the structured
+scan, so wording-only human changes keep machine JSON intact.
+
+Consumer rules:
+
+- Ignore unknown fields. Tolerate unknown finding codes/kinds, target
+  kinds, instance kinds (including `opaque`), component ids, and signal codes/statuses — never silently drop
+  them or fail parsing because of them. New codes/signals/instance kinds are additive.
+- `evidence` wording is not a stable contract. Decide on `code` / `kind` /
+  `category` / `scope` / `target` / `signals`.
+- Exit codes: 0 = no findings and fully diagnosable (parseable JSON);
+  1 = meaningful report with ≥1 finding (parseable JSON, including partial
+  diagnosability — every `diagnosable: false` ships with its
+  `diagnostic_failure` finding); 2 = usage / scope-resolution / missing
+  `python3` (required for `--json`) / no authoritative report — stdout is
+  empty and there is no JSON, read stderr instead.
+- `doctor.sh` is read-only: it never releases locks, removes pidfiles,
+  kills or restarts processes, mutates registrations, or sends messages.
+- `doctor.sh --json --redacted` is paste-safe and shares its pseudonym
+  mapping with the human `--redacted` report.
+- Breaking changes (renaming/removing a field or changing its meaning)
+  bump `schema_version` and are called out in
+  [CHANGELOG.md](../CHANGELOG.md). Additive changes do not bump it.
+
 ## Spawning and driving an agent
 
 Reading/writing agmsg data is one half of "building on agmsg" — the other is
