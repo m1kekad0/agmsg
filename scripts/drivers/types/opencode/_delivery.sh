@@ -77,14 +77,20 @@ EOF
   esac
 }
 agmsg_delivery_status() {
-  local type="$1" project="$2"
-  local rule_file
-  rule_file="$(resolve_hooks_file "$type" "$project")"
-  if [ ! -f "$rule_file" ]; then
-    echo "mode: off"
-  elif grep -q "agmsg-delivery-mode: monitor" "$rule_file" 2>/dev/null; then
-    echo "mode: monitor"
+  # mode 判定は共有 evaluator が SSOT (P1-4)。human は描画のみ。
+  if command -v agmsg_delivery_eval_mode >/dev/null 2>&1; then
+    agmsg_delivery_eval_mode "$1" "$2" || return 1
+    echo "mode: $AGMSG_DELIVERY_EVAL_MODE"
   else
-    echo "mode: turn"
+    local type="$1" project="$2"
+    local rule_file
+    rule_file="$(resolve_hooks_file "$type" "$project")"
+    if [ ! -f "$rule_file" ]; then
+      echo "mode: off"
+    elif grep -q "agmsg-delivery-mode: monitor" "$rule_file" 2>/dev/null; then
+      echo "mode: monitor"
+    else
+      echo "mode: turn"
+    fi
   fi
 }

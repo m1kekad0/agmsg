@@ -94,8 +94,10 @@ the human text; consume the JSON:
   observation `signals`, and `findings`. Every `scopes[]` entry has a
   non-empty `project`.
 - `global_components`: installation-wide type components (e.g. unattributed
-  Codex bridge bindings), each carrying its own `type` alongside `id`,
-  `instance`, and `signals`.
+  Codex bridge bindings, orphan app-servers), each carrying its own `type`
+  alongside `id`, `instance`, and `signals`. Multiple underlying instances
+  sharing one `id` are distinct entries with distinct opaque `instance`
+  identifiers (never grouped into one null-instance component).
 - `global_findings`: installation-wide findings (scope `project: null`,
   `type` kept when it belongs to one type).
 
@@ -105,19 +107,28 @@ global. Global records never synthesize a fake empty-project scope, and
 never inflate `summary.scopes`.
 
 Findings carry a stable snake_case `code` (e.g. `lock_stale`,
-`codex_version_drift`, `legacy_plug_unstructured`, `plug_collector_failed`), a `kind` (`condition` = noteworthy state observed,
+`codex_version_drift`, `legacy_plug_unstructured`, `plug_collector_failed`,
+`scan_failed`, `delivery_status_failed` — the latter also covers
+installation-wide delivery evaluation failures), a `kind` (`condition` = noteworthy state observed,
 `diagnostic_failure` = that range could not be fully diagnosed), an advisory
 `category` (`messaging` | `runtime` | `unknown`), a structured `target`
 (registration / component / null for scope-wide), and human-readable
-`evidence`. Components carry observation `signals` only — never a health
-verdict, and never raw PIDs, URLs, sockets, or file paths (those stay in
-redacted `evidence`).
+`evidence`. Component `target` instances are registration references,
+scope-singleton nulls, or opaque references (`{"kind":"opaque","id":...}`,
+e.g. `global_instance1` for orphan/unattributed globals — same raw key maps
+to the same opaque ID within one invocation, distinct keys map to distinct
+IDs). Components carry observation `signals` only — never a health
+verdict, and never raw PIDs, hashes, URLs, sockets, or file paths (those stay in
+redacted `evidence`). Human delivery text is never parsed into machine
+fields: delivery mode/watcher/stale observations come from the shared
+delivery evaluator used by both the human renderer and the structured
+scan, so wording-only human changes keep machine JSON intact.
 
 Consumer rules:
 
 - Ignore unknown fields. Tolerate unknown finding codes/kinds, target
-  kinds, component ids, and signal codes/statuses — never silently drop
-  them or fail parsing because of them. New codes/signals are additive.
+  kinds, instance kinds (including `opaque`), component ids, and signal codes/statuses — never silently drop
+  them or fail parsing because of them. New codes/signals/instance kinds are additive.
 - `evidence` wording is not a stable contract. Decide on `code` / `kind` /
   `category` / `scope` / `target` / `signals`.
 - Exit codes: 0 = no findings and fully diagnosable (parseable JSON);

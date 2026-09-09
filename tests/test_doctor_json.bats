@@ -649,7 +649,8 @@ write_orphan_appserver() {
   assert_json_eq '["global_findings"][0]["scope"]["type"]' "codex"
   assert_json_eq '["global_findings"][0]["target"]["kind"]' "component"
   assert_json_eq '["global_findings"][0]["target"]["component_id"]' "codex_app_server"
-  assert_json_eq '["global_findings"][0]["target"]["instance"]' "None"
+  # P1-6: global orphan は opaque instance を持ち、null へ group されない。
+  assert_json_python 'd["global_findings"][0]["target"]["instance"] is not None and d["global_findings"][0]["target"]["instance"]["kind"]=="opaque"' 'global orphan finding target must carry an opaque instance'
   # The registered scope keeps its own (empty) findings; summary.scopes is
   # not inflated by the global record.
   assert_json_eq '["summary"]["scopes"]' "1"
@@ -675,7 +676,8 @@ write_orphan_appserver() {
   fi
   assert_valid_json
   assert_json_python 'any(f["code"]=="codex_bridge_stale_pidfile" and f["scope"]=={"project": None, "type": "codex"} for f in d["global_findings"])' 'missing global codex_bridge_stale_pidfile finding'
-  assert_json_python 'any(c["id"]=="codex_bridge" and c["type"]=="codex" and c["instance"] is None and any(s=={"code": "process", "status": "not-running"} for s in c["signals"]) for c in d["global_components"])' 'missing global codex_bridge component signal'
+  # P1-6: global bridge は opaque instance を持ち、null へ group されない。
+  assert_json_python 'any(c["id"]=="codex_bridge" and c["type"]=="codex" and c["instance"] is not None and c["instance"].get("kind")=="opaque" and any(s=={"code": "process", "status": "not-running"} for s in c["signals"]) for c in d["global_components"])' 'missing global codex_bridge component signal'
   assert_json_python 'all(s["project"] for s in d["scopes"])' 'scopes[] contains an empty project'
   assert_json_eq '["summary"]["scopes"]' "1"
 }
@@ -690,7 +692,8 @@ write_orphan_appserver() {
     fail_assert "expected rc 1 for orphan triple, got $JSON_STATUS"
   fi
   assert_valid_json
-  assert_json_python 'any(c["id"]=="codex_app_server" and c["type"]=="codex" and c["instance"] is None for c in d["global_components"])' 'missing global codex_app_server component'
+  # P1-6: global orphan は opaque instance を持つ。
+  assert_json_python 'any(c["id"]=="codex_app_server" and c["type"]=="codex" and c["instance"] is not None and c["instance"].get("kind")=="opaque" for c in d["global_components"])' 'missing global codex_app_server component'
 }
 
 # --- collector failure: diagnostic_failure, never empty-stdout rc 1 ---------
@@ -839,5 +842,528 @@ EOF
   fi
   if ! grep -q "scoped record has no project" "$store/err.txt"; then
     fail_assert "stderr must name the scoped-record inconsistency"
+  fi
+}
+
+# --- P1-3: strict store validation (fail-closed) ------------------------------
+
+run_serializer() {
+  # $1: store dir. Sets SER_RC, leaves stdout in $store/out.json.
+  local store="$1" rc=0
+  python3 "$SCRIPTS/internal/doctor-json.py" \
+    --scopes "$store/scopes.tsv" \
+    --registrations "$store/regs.tsv" \
+    --components "$store/comps.tsv" \
+    --findings "$store/findings.tsv" \
+    --teams 0 >"$store/out.json" 2>"$store/err.txt" || rc=$?
+  SER_RC="$rc"
+}
+
+assert_serializer_rc2() {
+  # $1: store dir, $2: label. rc2, stdout empty, stderr concise.
+  local store="$1" label="$2"
+  if [ "$SER_RC" -ne 2 ]; then
+    fail_assert "expected rc 2 for $label, got $SER_RC"
+  fi
+  if [ -s "$store/out.json" ]; then
+    fail_assert "rc 2 must leave stdout empty ($label)"
+  fi
+  if [ ! -s "$store/err.txt" ]; then
+    fail_assert "rc 2 must explain on stderr ($label)"
+  fi
+  if grep -q "Traceback" "$store/err.txt"; then
+    fail_assert "stderr must stay concise, no traceback ($label)"
+  fi
+}
+
+@test "doctor --json serializer: short scope row is rc 2, never padded" {
+  local store="$TEST_SKILL_DIR/shortrow"
+  mkdir -p "$store"
+  : > "$store/regs.tsv"; : > "$store/comps.tsv"; : > "$store/findings.tsv"
+  printf 'proj\037codex\037turn\n' > "$store/scopes.tsv"
+  run_serializer "$store"
+  assert_serializer_rc2 "$store" "short scope row"
+}
+
+@test "doctor --json serializer: long scope row is rc 2, never truncated" {
+  local store="$TEST_SKILL_DIR/longrow"
+  mkdir -p "$store"
+  : > "$store/regs.tsv"; : > "$store/comps.tsv"; : > "$store/findings.tsv"
+  printf 'proj\037codex\037turn\037ok\037extra\n' > "$store/scopes.tsv"
+  run_serializer "$store"
+  assert_serializer_rc2 "$store" "long scope row"
+}
+
+@test "doctor --json serializer: registration without scope is rc 2" {
+  local store="$TEST_SKILL_DIR/orphanreg"
+  mkdir -p "$store"
+  printf 'proj\037codex\037turn\037ok\n' > "$store/scopes.tsv"
+  printf 'elsewhere\037codex\037team\037alice\037alive\037none\n' > "$store/regs.tsv"
+  : > "$store/comps.tsv"; : > "$store/findings.tsv"
+  run_serializer "$store"
+  assert_serializer_rc2 "$store" "registration without scope"
+  if ! grep -q "without scope" "$store/err.txt"; then
+    fail_assert "stderr must name orphan child"
+  fi
+}
+
+@test "doctor --json serializer: component without scope is rc 2" {
+  local store="$TEST_SKILL_DIR/orphancomp"
+  mkdir -p "$store"
+  printf 'proj\037codex\037turn\037ok\n' > "$store/scopes.tsv"
+  : > "$store/regs.tsv"; : > "$store/findings.tsv"
+  printf 'elsewhere\037codex\037codex_app_server\037\037\037process\037dead\037\n' > "$store/comps.tsv"
+  run_serializer "$store"
+  assert_serializer_rc2 "$store" "component without scope"
+}
+
+@test "doctor --json serializer: finding without scope is rc 2" {
+  local store="$TEST_SKILL_DIR/orphanfinding"
+  mkdir -p "$store"
+  printf 'proj\037codex\037turn\037ok\n' > "$store/scopes.tsv"
+  : > "$store/regs.tsv"; : > "$store/comps.tsv"
+  printf 'codex_pid_stale\037condition\037runtime\037elsewhere\037codex\037component\037\037\037codex_app_server\037ev\037\n' > "$store/findings.tsv"
+  run_serializer "$store"
+  assert_serializer_rc2 "$store" "finding without scope"
+}
+
+@test "doctor --json serializer: duplicate conflicting scope is rc 2" {
+  local store="$TEST_SKILL_DIR/dupscope"
+  mkdir -p "$store"
+  printf 'proj\037codex\037turn\037ok\nproj\037codex\037monitor\037ok\n' > "$store/scopes.tsv"
+  : > "$store/regs.tsv"; : > "$store/comps.tsv"; : > "$store/findings.tsv"
+  run_serializer "$store"
+  assert_serializer_rc2 "$store" "duplicate scope"
+  if ! grep -q "duplicate scope" "$store/err.txt"; then
+    fail_assert "stderr must name duplicate scope"
+  fi
+}
+
+# --- P1-1: global delivery failure is fail-closed, never false healthy ------
+
+@test "doctor --json: global delivery failure is rc 1 with global diagnostic_failure" {
+  # Global `delivery.sh status` (no args) exits 7, scoped calls succeed.
+  # rc must be 1 with parseable JSON, top-level diagnosable:false, and a
+  # global delivery_status_failed -- never rc 0 false healthy.
+  configured_off "$PROJ"
+  mv "$SCRIPTS/delivery.sh" "$SCRIPTS/delivery.sh.real"
+  cat > "$SCRIPTS/delivery.sh" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "status" ] && [ "$#" -eq 1 ]; then
+  echo "mock global delivery failure" >&2
+  exit 7
+fi
+exec bash "$(dirname "$0")/delivery.sh.real" "$@"
+EOF
+  chmod +x "$SCRIPTS/delivery.sh"
+  run_json --project "$PROJ" --type claude-code
+  local rc="$JSON_STATUS"
+  mv "$SCRIPTS/delivery.sh.real" "$SCRIPTS/delivery.sh"
+  if [ "$rc" -ne 1 ]; then
+    fail_assert "expected rc 1 for global delivery failure, got $rc"
+  fi
+  assert_valid_json
+  assert_json_eq '["diagnosable"]' "False"
+  assert_json_python 'any(f["code"]=="delivery_status_failed" and f["kind"]=="diagnostic_failure" and f["scope"]=={"project": None, "type": None} for f in d["global_findings"])' 'missing global delivery_status_failed'
+  if [ "$(json_get '["global_findings"]')" = "[]" ]; then
+    fail_assert "global findings must not be empty on global delivery failure"
+  fi
+}
+
+# --- P1-6: global components carry distinct opaque instances ------------------
+
+write_two_orphan_appservers() {
+  # Two orphan triples with distinct hashes.
+  local h1="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" h2="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" dead
+  dead="$(dead_pid)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$dead" > "$TEST_SKILL_DIR/run/codex-app-server.$h1.pid"
+  printf '%s\n' "64341" > "$TEST_SKILL_DIR/run/codex-app-server.$h1.port"
+  printf '%s\n' "codex-cli 9.9.9-test" > "$TEST_SKILL_DIR/run/codex-app-server.$h1.version"
+  printf '%s\n' "$dead" > "$TEST_SKILL_DIR/run/codex-app-server.$h2.pid"
+  printf '%s\n' "64342" > "$TEST_SKILL_DIR/run/codex-app-server.$h2.port"
+  printf '%s\n' "codex-cli 9.9.9-test" > "$TEST_SKILL_DIR/run/codex-app-server.$h2.version"
+}
+
+@test "doctor --json: two orphan app-servers are two global components with distinct opaque instances" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  write_two_orphan_appservers
+
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for two orphans, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'len([c for c in d["global_components"] if c["id"]=="codex_app_server"]) == 2' 'expected 2 global codex_app_server components'
+  assert_json_python 'len({c["instance"]["id"] for c in d["global_components"] if c["id"]=="codex_app_server"}) == 2' 'opaque instance IDs must be distinct'
+  assert_json_python 'all(c["instance"] is not None and c["instance"].get("kind")=="opaque" for c in d["global_components"] if c["id"]=="codex_app_server")' 'global components must carry opaque instances'
+  # Each finding target references its own instance; no evidence parsing needed.
+  assert_json_python 'all(f["target"] is not None and f["target"].get("instance") is not None and f["target"]["instance"].get("kind")=="opaque" for f in d["global_findings"] if f["target"] is not None and f["target"].get("component_id")=="codex_app_server")' 'finding targets must reference opaque instances'
+  # Raw hashes never appear as structured data.
+  if grep -q "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$JSON_OUT"; then
+    fail_assert "raw orphan hash leaked into payload"
+  fi
+  if grep -q "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$JSON_OUT"; then
+    fail_assert "raw orphan hash leaked into payload"
+  fi
+}
+
+@test "doctor --json: two unattributed bridges are two global components with distinct opaque instances" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  local dead
+  dead="$(dead_pid)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  for k in "ghost.one" "ghost.two"; do
+    printf '%s\n' "$dead" > "$TEST_SKILL_DIR/run/codex-bridge.$k.pid"
+    printf '%s' "ws://127.0.0.1:1" > "$TEST_SKILL_DIR/run/codex-bridge.$k.appserver"
+    printf '%s' "thread-$k" > "$TEST_SKILL_DIR/run/codex-bridge.$k.thread"
+  done
+
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for two bridges, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'len([c for c in d["global_components"] if c["id"]=="codex_bridge"]) == 2' 'expected 2 global codex_bridge components'
+  assert_json_python 'len({c["instance"]["id"] for c in d["global_components"] if c["id"]=="codex_bridge"}) == 2' 'bridge opaque instances must be distinct'
+  if grep -qF "ghost.one" "$JSON_OUT"; then
+    fail_assert "raw bridge key ghost.one leaked"
+  fi
+  if grep -qF "ghost.two" "$JSON_OUT"; then
+    fail_assert "raw bridge key ghost.two leaked"
+  fi
+}
+
+# --- P1-5: global redaction never leaks raw orphan keys -----------------------
+
+@test "doctor --json --redacted: raw orphan key, deleted team/agent, thread never leak" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  local dead rawkey rawthread
+  dead="$(dead_pid)"
+  rawkey="ghostteam.ghostagent"
+  rawthread="thread-secret-9f8e7d6c-1234"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$dead" > "$TEST_SKILL_DIR/run/codex-bridge.$rawkey.pid"
+  printf '%s' "ws://127.0.0.1:1" > "$TEST_SKILL_DIR/run/codex-bridge.$rawkey.appserver"
+  printf '%s' "$rawthread" > "$TEST_SKILL_DIR/run/codex-bridge.$rawkey.thread"
+
+  run_json --type codex --redacted
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for orphan bridge, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_absent "$rawkey" "raw orphan key"
+  assert_absent "ghostteam" "raw deleted team"
+  assert_absent "ghostagent" "raw deleted agent"
+  assert_absent "$rawthread" "raw thread"
+  # Opaque pseudonym is present and shared with human redacted output.
+  assert_json_python 'any(c["instance"] is not None and c["instance"].get("kind")=="opaque" for c in d["global_components"])' 'opaque instance missing'
+  run bash "$SCRIPTS/doctor.sh" --type codex --redacted
+  if printf '%s\n' "$output" | grep -qF "$rawkey"; then
+    fail_assert "human redacted output leaked raw orphan key"
+  fi
+  if printf '%s\n' "$output" | grep -qF "$rawthread"; then
+    fail_assert "human redacted output leaked raw thread"
+  fi
+}
+
+# --- P1-2: fatal-error boundary and stdout purity ------------------------------
+
+@test "doctor --json: mktemp failure is rc 2 with empty stdout" {
+  configured_off "$PROJ"
+  local fakebin="$TEST_SKILL_DIR/fakebin-mktemp"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+echo "mock mktemp failure" >&2
+exit 1
+EOF
+  chmod +x "$fakebin/mktemp"
+  local rc=0
+  PATH="$fakebin:$PATH" bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for mktemp failure, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (mktemp failure)"
+  fi
+  if [ ! -s "$TEST_SKILL_DIR/err.txt" ]; then
+    fail_assert "rc 2 must explain on stderr"
+  fi
+}
+
+@test "doctor --json: store write failure is rc 2 with empty stdout" {
+  # Fake mktemp succeeds but returns a read-only dir, so `: > file`
+  # creation inside the store fails. Same ERR boundary as mktemp failure,
+  # but a distinct injection point (create/write vs mktemp itself).
+  configured_off "$PROJ"
+  local fakebin="$TEST_SKILL_DIR/fakebin-write"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+real="$(command -v -p mktemp 2>/dev/null || printf '/usr/bin/mktemp')"
+if [ ! -x "$real" ]; then real="/bin/mktemp"; fi
+d="$("$real" -d "${TMPDIR:-/tmp}/agmsg-doctor.XXXXXX")"
+chmod 500 "$d"
+printf '%s\n' "$d"
+EOF
+  chmod +x "$fakebin/mktemp"
+  local rc=0
+  PATH="$fakebin:$PATH" bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  # Cleanup read-only dirs left by the fake mktemp.
+  chmod -R u+w "${TMPDIR:-/tmp}"/agmsg-doctor.* 2>/dev/null || true
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for store write failure, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (store write failure)"
+  fi
+  if [ ! -s "$TEST_SKILL_DIR/err.txt" ]; then
+    fail_assert "rc 2 must explain on stderr"
+  fi
+}
+
+install_noisy_plug() {
+  # Structured plug whose *source* prints to stdout. JSON stdout must stay
+  # pure (noise goes to stderr, never to the payload).
+  cat > "$TYPES/claude-code/_doctor.sh" <<'EOF'
+echo "SOURCE_NOISE"
+[ -n "${_AGMSG_NOISY_SH:-}" ] && return 0
+_AGMSG_NOISY_SH=1
+agmsg_doctor_extra_collect() { return 0; }
+agmsg_doctor_extra_global_collect() { return 0; }
+EOF
+}
+
+@test "doctor --json: plug source noise never pollutes stdout" {
+  install_noisy_plug
+  configured_off "$PROJ"
+
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail_assert "expected rc 0 for noisy-but-successful plug, got $rc"
+  fi
+  if grep -q "SOURCE_NOISE" "$TEST_SKILL_DIR/out.txt"; then
+    fail_assert "plug source noise polluted JSON stdout"
+  fi
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TEST_SKILL_DIR/out.txt"
+  if [ "$(wc -l < "$TEST_SKILL_DIR/out.txt" | tr -d ' ')" != "1" ]; then
+    fail_assert "JSON stdout must stay a single line"
+  fi
+}
+
+install_source_failing_plug() {
+  # Structured plug file whose source itself exits nonzero. The file still
+  # contains the collector entry points (so the pre-source grep marks it as
+  # structured), but `return 42` fires before they are defined.
+  cat > "$TYPES/claude-code/_doctor.sh" <<'EOF'
+[ -n "${_AGMSG_SRCSH:-}" ] && return 0
+_AGMSG_SRCSH=1
+return 42
+agmsg_doctor_extra_collect() { return 0; }
+agmsg_doctor_extra_global_collect() { return 0; }
+EOF
+}
+
+@test "doctor --json: plug source failure is plug_collector_failed with rc 1 JSON" {
+  install_source_failing_plug
+  configured_off "$PROJ"
+
+  run_json --project "$PROJ" --type claude-code
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for plug source failure, got $JSON_STATUS"
+  fi
+  if [ ! -s "$JSON_OUT" ]; then
+    fail_assert "rc 1 must carry JSON (source failure)"
+  fi
+  assert_valid_json
+  assert_json_eq '["scopes"][0]["diagnosable"]' "False"
+  assert_json_eq '["scopes"][0]["findings"][0]["code"]' "plug_collector_failed"
+}
+
+@test "doctor --json: identities failure is scan_failed with rc 1 JSON, never empty stdout" {
+  # --type (not --project) so SCOPE building via registered_projects succeeds
+  # and the per-pair identities lookup fails as partial (scan_failed), not
+  # fatal SCOPE resolution (rc 2).
+  configured_off "$PROJ"
+  mv "$SCRIPTS/identities.sh" "$SCRIPTS/identities.sh.real"
+  cat > "$SCRIPTS/identities.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "mock identities failure" >&2
+exit 3
+EOF
+  chmod +x "$SCRIPTS/identities.sh"
+  run_json --type claude-code
+  local rc="$JSON_STATUS"
+  mv "$SCRIPTS/identities.sh.real" "$SCRIPTS/identities.sh"
+  if [ "$rc" -ne 1 ]; then
+    # Fatal rc 2 with empty stdout is also contract-compliant, but this
+    # path is specified as partial (rc 1 + JSON) so the scope survives.
+    fail_assert "expected rc 1 for identities failure, got $rc"
+  fi
+  if [ ! -s "$JSON_OUT" ]; then
+    fail_assert "rc 1 must carry JSON (identities failure)"
+  fi
+  assert_valid_json
+  assert_json_python 'any(f["code"]=="scan_failed" and f["kind"]=="diagnostic_failure" for s in d["scopes"] for f in s["findings"])' 'missing scan_failed diagnostic_failure'
+}
+
+# --- P1-4: no human-text parsing; wording change keeps machine JSON ---------
+
+@test "doctor --json: delivery human wording change keeps machine JSON intact" {
+  # Change only the human wording of delivery.sh status (mode line stays
+  # "mode: ..." for display, but stale phrasing and watch line are altered).
+  # Machine fields (delivery.mode, watcher_stale_pidfile) come from the
+  # shared evaluator, not from grep/sed of this text, so JSON is unchanged.
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  local dead
+  dead="$(dead_pid)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$dead" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid"
+  printf '%s' "ws://127.0.0.1:1" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.appserver"
+  printf '%s' "thread-w" > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.thread"
+  {
+    echo "pid=$dead"
+    echo "project=$PROJ"
+    echo "identities=team/alice"
+    echo "type=codex"
+  } > "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta"
+
+  # Baseline JSON with real wording.
+  run_json --project "$PROJ" --type codex
+  local base_rc="$JSON_STATUS"
+  cp "$JSON_OUT" "$TEST_SKILL_DIR/base.json"
+
+  # Wording-only wrapper: same exit codes, same underlying files, but the
+  # human phrases doctor used to grep for are gone.
+  mv "$SCRIPTS/delivery.sh" "$SCRIPTS/delivery.sh.real"
+  cat > "$SCRIPTS/delivery.sh" <<'EOF'
+#!/usr/bin/env bash
+out="$(bash "$(dirname "$0")/delivery.sh.real" "$@" 2>&1)"
+rc=$?
+printf '%s\n' "$out" | sed -e 's/stale pidfile (/STALE-RENAMED (/' -e 's/^watch processes: /watch PROCS: /'
+exit "$rc"
+EOF
+  chmod +x "$SCRIPTS/delivery.sh"
+  run_json --project "$PROJ" --type codex
+  local rc2="$JSON_STATUS"
+  cp "$JSON_OUT" "$TEST_SKILL_DIR/wording.json"
+  mv "$SCRIPTS/delivery.sh.real" "$SCRIPTS/delivery.sh"
+
+  if [ "$base_rc" -ne "$rc2" ]; then
+    fail_assert "wording change altered rc ($base_rc vs $rc2)"
+  fi
+  # Machine codes/scopes/targets identical; only human evidence wording may
+  # differ (it quotes the human block). Compare the machine subset.
+  if ! python3 - "$TEST_SKILL_DIR/base.json" "$TEST_SKILL_DIR/wording.json" <<'EOF'; then
+import json,sys
+a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2]))
+def machine(d):
+    return (d["diagnosable"],
+            [(s["project"],s["type"],s["diagnosable"],s["delivery"],
+              [(f["code"],f["kind"],f["category"],f["scope"],f["target"]) for f in s["findings"]],
+              [(c["id"],c["instance"],c["signals"]) for c in s["components"]]) for s in d["scopes"]],
+            [(f["code"],f["kind"],f["category"],f["scope"],f["target"]) for f in d["global_findings"]])
+assert machine(a)==machine(b), "machine JSON changed on wording-only edit"
+EOF
+    fail_assert "machine JSON changed on wording-only edit"
+  fi
+}
+
+@test "doctor --json: shared delivery evaluator agrees with human first line" {
+  # Fixture/helper boundary directly: evaluator mode equals the human
+  # "mode: ..." first line for a configured project, without parsing.
+  configured_off "$PROJ"
+  local human_first mode_eval
+  human_first="$(bash "$SCRIPTS/delivery.sh" status claude-code "$PROJ" 2>/dev/null | head -1)"
+  mode_eval="$(bash -c '. "$1/lib/delivery-eval.sh"; agmsg_delivery_eval_mode claude-code "$2" && printf "%s" "$AGMSG_DELIVERY_EVAL_MODE"' bash "$SCRIPTS" "$PROJ")"
+  if [ "mode: $mode_eval" != "$human_first" ]; then
+    fail_assert "evaluator mode [$mode_eval] disagrees with human [$human_first]"
+  fi
+}
+
+# --- P2: control characters are rejected, never lossily flattened ------------
+
+@test "doctor --json: project with TAB is rc 2 fail-closed" {
+  local tabproj="$TEST_SKILL_DIR/$(printf 'tab\tproj')"
+  mkdir -p "$tabproj"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$tabproj" >/dev/null
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$tabproj" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for TAB project, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (TAB project)"
+  fi
+}
+
+@test "doctor --json: project with newline is rc 2 fail-closed" {
+  local nlproj="$TEST_SKILL_DIR/$(printf 'nl\nproj')"
+  mkdir -p "$nlproj"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$nlproj" >/dev/null
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$nlproj" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for newline project, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (newline project)"
+  fi
+}
+
+install_newline_evidence_plug() {
+  cat > "$TYPES/claude-code/_doctor.sh" <<'EOF'
+[ -n "${_AGMSG_NLEVID_SH:-}" ] && return 0
+_AGMSG_NLEVID_SH=1
+agmsg_doctor_extra_collect() {
+  agmsg_doctor_finding_add ev_nl condition runtime "" "claude-code" "" "" "" "" "$(printf 'line1\nline2')" ""
+  return 0
+}
+agmsg_doctor_extra_global_collect() { return 0; }
+EOF
+}
+
+@test "doctor --json: evidence newline is rc 2, never flattened" {
+  install_newline_evidence_plug
+  configured_off "$PROJ"
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for newline evidence, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (newline evidence)"
+  fi
+}
+
+install_us_evidence_plug() {
+  cat > "$TYPES/claude-code/_doctor.sh" <<'EOF'
+[ -n "${_AGMSG_USEVID_SH:-}" ] && return 0
+_AGMSG_USEVID_SH=1
+agmsg_doctor_extra_collect() {
+  agmsg_doctor_finding_add ev_us condition runtime "" "claude-code" "" "" "" "" "$(printf 'a\037b')" ""
+  return 0
+}
+agmsg_doctor_extra_global_collect() { return 0; }
+EOF
+}
+
+@test "doctor --json: evidence unit separator is rc 2, never flattened" {
+  install_us_evidence_plug
+  configured_off "$PROJ"
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for unit-separator evidence, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (unit separator)"
   fi
 }
