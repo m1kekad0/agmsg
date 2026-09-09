@@ -475,10 +475,24 @@ _doctor_store_init() {
   _DOCTOR_FINDINGS_FILE="$_DOCTOR_TMP/findings.tsv"
   _DOCTOR_DISPLAY_FILE="$_DOCTOR_TMP/display.tsv"
   _DOCTOR_GLOBAL_DISPLAY_FILE="$_DOCTOR_TMP/global_display.tsv"
-  : > "$_DOCTOR_SCOPES_FILE"; : > "$_DOCTOR_REGS_FILE"
-  : > "$_DOCTOR_COMPS_FILE"; : > "$_DOCTOR_FINDINGS_FILE"
-  : > "$_DOCTOR_DISPLAY_FILE"; : > "$_DOCTOR_GLOBAL_DISPLAY_FILE"
+  # 各 write を明示的に fatal 化する: collector は `|| rc=$?` で呼ばれる
+  # ため Bash 3.2 では内側の set -e / ERR trap が信頼できず、裸の write
+  # 失敗は false healthy (rc0/record missing) になり得る。
+  : > "$_DOCTOR_SCOPES_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_REGS_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_COMPS_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_FINDINGS_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_DISPLAY_FILE" || _doctor_fatal "failed to init scan store"
+  : > "$_DOCTOR_GLOBAL_DISPLAY_FILE" || _doctor_fatal "failed to init scan store"
 }
+# Control-char singletons ($'...' は command substitution と異なり末尾改行
+# strip が起きない。$(printf '\n') は空文字になるため *""* が全値に match
+# する事故を起こす。bash 3.2 の ANSI-C quoting で定義する)。
+TAB_CHAR=$'\t'
+LF_CHAR=$'\n'
+CR_CHAR=$'\r'
+US_CHAR=$'\037'
+X01_CHAR=$'\001'
 # Input-boundary validation (P2): control characters are rejected, never
 # lossily flattened. TAB/newline/CR/unit-separator in any store field would
 # either break TSV framing (newline splits rows) or collide distinct raw
@@ -499,14 +513,21 @@ _doctor_flat() {
   esac
   _FLAT_OUT="$_v"
 }
-# Control-char singletons ($'...' は command substitution と異なり末尾改行
-# strip が起きない。$(printf '\n') は空文字になるため *""* が全値に match
-# する事故を起こす。bash 3.2 の ANSI-C quoting で定義する)。
-TAB_CHAR=$'\t'
-LF_CHAR=$'\n'
-CR_CHAR=$'\r'
-US_CHAR=$'\037'
-X01_CHAR=$'\001'
+# Raw control-char validation (P2 ordering): redaction や command
+# substitution の前に RAW 値へかける。$() は末尾 newline を削除し、
+# redaction は raw を pseudonym へ置換して control char を隠すため、
+# 変換後の検査だけでは trailing newline の消失と redacted 時のすり抜けを
+# 検出できない。正しい順序は RAW validation → redaction → post 検証 →
+# store write である。全 store-bound 値の redaction/$() より前に呼ぶこと。
+_doctor_validate_raw_field() {
+  local _v="${1:-}"
+  case "$_v" in
+    *"$TAB_CHAR"*|*"$LF_CHAR"*|*"$CR_CHAR"*|*"$US_CHAR"*|*"$X01_CHAR"*)
+      printf 'doctor: rejected control character in store field\n' >&2
+      _doctor_fatal "rejected control character in store field"
+      ;;
+  esac
+}
 # Scope finding codes (core doctor warnings):
 #   lock_stale                    stale actas lock (condition/messaging, registration target)
 #   lock_no_watcher               live lock with no watcher pidfile (condition/messaging, registration)
@@ -533,6 +554,13 @@ _doctor_warn() {
   shift 9
   case "${1:-}" in --) shift ;; esac
   local human="$1" dproj="" dteam="" dagent="" evidence=""
+  # RAW validation first: redaction/$() の前に検査する ($() は末尾 newline
+  # を削除し、redaction は raw を pseudonym へ置換して control char を隠す)。
+  _doctor_validate_raw_field "$code"; _doctor_validate_raw_field "$kind"
+  _doctor_validate_raw_field "$category"; _doctor_validate_raw_field "$sproj"
+  _doctor_validate_raw_field "$stype"; _doctor_validate_raw_field "$tkind"
+  _doctor_validate_raw_field "$tteam"; _doctor_validate_raw_field "$tagent"
+  _doctor_validate_raw_field "$tcomp"; _doctor_validate_raw_field "$human"
   WARNINGS="${WARNINGS}${human}"$'\n'
   [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
   if [ -n "$tkind" ] && [ -n "$tteam" ]; then _redact_team "$tteam"; dteam="$_REDACT_OUT"; fi
@@ -552,7 +580,7 @@ _doctor_warn() {
   _doctor_flat "$evidence"; local fev="$_FLAT_OUT"
   printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
     "$fcode" "$fkind" "$fcat" "$fsproj" "$fstype" \
-    "$ftkind" "$ftteam" "$ftagent" "$ftcomp" "$fev" "" >> "$_DOCTOR_FINDINGS_FILE"
+    "$ftkind" "$ftteam" "$ftagent" "$ftcomp" "$fev" "" >> "$_DOCTOR_FINDINGS_FILE" || _doctor_fatal "failed to append finding"
 }
 # Structured collector API for type plugs (Issue #8 "New collector
 # entrypoints" protocol). A plug implementing
@@ -568,6 +596,12 @@ agmsg_doctor_finding_add() {
   local code="${1:-}" kind="${2:-}" category="${3:-}" sproj="${4:-}" stype="${5:-}"
   local tkind="${6:-}" tteam="${7:-}" tagent="${8:-}" tcomp="${9:-}" evidence="${10:-}"
   local opaque="${11:-}"
+  _doctor_validate_raw_field "$code"; _doctor_validate_raw_field "$kind"
+  _doctor_validate_raw_field "$category"; _doctor_validate_raw_field "$sproj"
+  _doctor_validate_raw_field "$stype"; _doctor_validate_raw_field "$tkind"
+  _doctor_validate_raw_field "$tteam"; _doctor_validate_raw_field "$tagent"
+  _doctor_validate_raw_field "$tcomp"; _doctor_validate_raw_field "$evidence"
+  _doctor_validate_raw_field "$opaque"
   local dproj="" dteam="" dagent="" ev=""
   [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
   if [ -n "$tkind" ] && [ -n "$tteam" ]; then _redact_team "$tteam"; dteam="$_REDACT_OUT"; fi
@@ -586,7 +620,7 @@ agmsg_doctor_finding_add() {
   _doctor_flat "$opaque"; opaque="$_FLAT_OUT"
   printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
     "$code" "$kind" "$category" "$dproj" "$stype" \
-    "$tkind" "$dteam" "$dagent" "$tcomp" "$ev" "$opaque" >> "$_DOCTOR_FINDINGS_FILE"
+    "$tkind" "$dteam" "$dagent" "$tcomp" "$ev" "$opaque" >> "$_DOCTOR_FINDINGS_FILE" || _doctor_fatal "failed to append finding"
 }
 # agmsg_doctor_component_signal <scope_project_raw> <scope_type> <component_id>
 #   <instance_team_raw> <instance_agent_raw> <signal_code> <signal_status> [opaque]
@@ -596,6 +630,10 @@ agmsg_doctor_finding_add() {
 agmsg_doctor_component_signal() {
   local sproj="${1:-}" stype="${2:-}" comp="${3:-}" iteam="${4:-}" iagent="${5:-}"
   local scode="${6:-}" sstatus="${7:-}" opaque="${8:-}"
+  _doctor_validate_raw_field "$sproj"; _doctor_validate_raw_field "$stype"
+  _doctor_validate_raw_field "$comp"; _doctor_validate_raw_field "$iteam"
+  _doctor_validate_raw_field "$iagent"; _doctor_validate_raw_field "$scode"
+  _doctor_validate_raw_field "$sstatus"; _doctor_validate_raw_field "$opaque"
   local dproj="" dteam="" dagent=""
   [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
   if [ -n "$iteam" ]; then _redact_team "$iteam"; dteam="$_REDACT_OUT"; fi
@@ -609,24 +647,27 @@ agmsg_doctor_component_signal() {
   _doctor_flat "$sstatus"; sstatus="$_FLAT_OUT"
   _doctor_flat "$opaque"; opaque="$_FLAT_OUT"
   printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
-    "$dproj" "$stype" "$comp" "$dteam" "$dagent" "$scode" "$sstatus" "$opaque" >> "$_DOCTOR_COMPS_FILE"
+    "$dproj" "$stype" "$comp" "$dteam" "$dagent" "$scode" "$sstatus" "$opaque" >> "$_DOCTOR_COMPS_FILE" || _doctor_fatal "failed to append component signal"
 }
 # Plug display lines for the human block (raw; redacted at render time like
 # the legacy protocol). One stored line per call.
 agmsg_doctor_display_add() {
   local sproj="${1:-}" stype="${2:-}" line="${3:-}"
+  _doctor_validate_raw_field "$sproj"; _doctor_validate_raw_field "$stype"
+  _doctor_validate_raw_field "$line"
   local dproj=""
   [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
   _doctor_flat "$dproj"; dproj="$_FLAT_OUT"
   _doctor_flat "$stype"; stype="$_FLAT_OUT"
   _doctor_flat "$line"; line="$_FLAT_OUT"
-  printf '%s\037%s\037%s\n' "$dproj" "$stype" "$line" >> "$_DOCTOR_DISPLAY_FILE"
+  printf '%s\037%s\037%s\n' "$dproj" "$stype" "$line" >> "$_DOCTOR_DISPLAY_FILE" || _doctor_fatal "failed to append display line"
 }
 agmsg_doctor_global_display_add() {
   local stype="${1:-}" line="${2:-}"
+  _doctor_validate_raw_field "$stype"; _doctor_validate_raw_field "$line"
   _doctor_flat "$stype"; stype="$_FLAT_OUT"
   _doctor_flat "$line"; line="$_FLAT_OUT"
-  printf '%s\037%s\n' "$stype" "$line" >> "$_DOCTOR_GLOBAL_DISPLAY_FILE"
+  printf '%s\037%s\n' "$stype" "$line" >> "$_DOCTOR_GLOBAL_DISPLAY_FILE" || _doctor_fatal "failed to append display line"
 }
 # Render the records one structured plug collection appended (lines after
 # the given 1-based start offsets) into the human report: findings for this
@@ -683,6 +724,9 @@ _doctor_render_global_store() {
 _doctor_reg_add() {
   local sproj="${1:-}" stype="${2:-}" team="${3:-}" agent="${4:-}"
   local lock="${5:-}" watcher="${6:-}"
+  _doctor_validate_raw_field "$sproj"; _doctor_validate_raw_field "$stype"
+  _doctor_validate_raw_field "$team"; _doctor_validate_raw_field "$agent"
+  _doctor_validate_raw_field "$lock"; _doctor_validate_raw_field "$watcher"
   local dproj="" dteam="" dagent=""
   [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
   _redact_team "$team"; dteam="$_REDACT_OUT"
@@ -694,7 +738,7 @@ _doctor_reg_add() {
   _doctor_flat "$lock"; lock="$_FLAT_OUT"
   _doctor_flat "$watcher"; watcher="$_FLAT_OUT"
   printf '%s\037%s\037%s\037%s\037%s\037%s\n' \
-    "$dproj" "$stype" "$dteam" "$dagent" "$lock" "$watcher" >> "$_DOCTOR_REGS_FILE"
+    "$dproj" "$stype" "$dteam" "$dagent" "$lock" "$watcher" >> "$_DOCTOR_REGS_FILE" || _doctor_fatal "failed to append registration"
 }
 # Per-scope delivery observation: status is ok|failed|skipped. The mode line
 # can name the project (the "off (unrecognized: ...)" annotation quotes the
@@ -703,6 +747,8 @@ _doctor_reg_add() {
 # the raw path here while masking it everywhere else.
 _doctor_scope_add() {
   local sproj="${1:-}" stype="${2:-}" mode="${3:-}" dstatus="${4:-}"
+  _doctor_validate_raw_field "$sproj"; _doctor_validate_raw_field "$stype"
+  _doctor_validate_raw_field "$mode"; _doctor_validate_raw_field "$dstatus"
   local dproj=""
   [ -n "$sproj" ] && { _redact_project "$sproj"; dproj="$_REDACT_OUT"; }
   mode="$(_redact_text "$mode" "$sproj")"
@@ -710,7 +756,7 @@ _doctor_scope_add() {
   _doctor_flat "$stype"; stype="$_FLAT_OUT"
   _doctor_flat "$mode"; mode="$_FLAT_OUT"
   _doctor_flat "$dstatus"; dstatus="$_FLAT_OUT"
-  printf '%s\037%s\037%s\037%s\n' "$dproj" "$stype" "$mode" "$dstatus" >> "$_DOCTOR_SCOPES_FILE"
+  printf '%s\037%s\037%s\037%s\n' "$dproj" "$stype" "$mode" "$dstatus" >> "$_DOCTOR_SCOPES_FILE" || _doctor_fatal "failed to append scope"
 }
 
 # --- scan one (project, type) pair, buffer its block ------------------------
@@ -800,14 +846,17 @@ _doctor_scan_pair() {
   local eval_stale=0 eval_stale_ok=1
   if [ "$type_has_delivery" -eq 1 ]; then
     # Machine: mode は evaluator から直接取得 (human text parse 禁止)。
-    if agmsg_delivery_eval_mode "$type" "$project" 2>/dev/null; then
+    # stdout 隔離 (1>&2): evaluator/helper の stdout が最終 stdout へ直接
+    # 流れないよう stderr へ逃がす。machine evaluator は stdout を contract
+    # にしないため、noise があっても JSON を汚さない。
+    if agmsg_delivery_eval_mode "$type" "$project" 1>&2 2>/dev/null; then
       mode="$AGMSG_DELIVERY_EVAL_MODE"
     else
       eval_ok=0
       mode="off"
     fi
     # Machine: scoped stale は evaluator から直接取得 (human text parse 禁止)。
-    if agmsg_delivery_eval_scoped_stale "$type" "$project" 2>/dev/null; then
+    if agmsg_delivery_eval_scoped_stale "$type" "$project" 1>&2 2>/dev/null; then
       eval_stale="$AGMSG_DELIVERY_EVAL_SCOPED_STALE"
     else
       eval_stale_ok=0
@@ -829,7 +878,7 @@ _doctor_scan_pair() {
     delivery_output="$(printf '%s\n' "$delivery_output" | grep -v '^watch processes: ' || true)"
   else
     # No-delivery type (off のみ): evaluator から off を取得する。
-    if agmsg_delivery_eval_mode "$type" "$project" 2>/dev/null; then
+    if agmsg_delivery_eval_mode "$type" "$project" 1>&2 2>/dev/null; then
       mode="$AGMSG_DELIVERY_EVAL_MODE"
     else
       mode="off"
@@ -1208,7 +1257,7 @@ fi
 # GLOBAL_WATCH_LINE を sed して machine count へ変換しない。human 表示は
 # GLOBAL_WATCH_LINE をそのまま使い、machine 判定は evaluator の counts を
 # 直接使う。wording 変更では JSON は壊れない。
-if agmsg_delivery_eval_watchers 2>/dev/null; then
+if agmsg_delivery_eval_watchers 1>&2 2>/dev/null; then
   if [ "${AGMSG_DELIVERY_EVAL_WATCH_STALE:-0}" -gt 0 ]; then
     _doctor_warn watcher_stale_pidfile_global condition runtime "" "" \
       "" "" "" "" -- \
@@ -1336,11 +1385,32 @@ if [ "$JSON_MODE" -eq 1 ]; then
     --filter-project "$_json_filter_project" \
     --filter-type "$FILTER_TYPE" \
     --filter-team "$_json_filter_team" \
-    --teams "$TEAM_COUNT"; then
-    exit 0
+    --teams "$TEAM_COUNT" >"$_DOCTOR_TMP/serializer-out.json" 2>"$_DOCTOR_TMP/serializer-err.txt"; then
+    _json_rc=0
   else
     _json_rc=$?
+  fi
+  # Publish boundary: serializer の stdout を直接最終 stdout へ出さず、
+  # temp へ出して rc/output を検証してから初めて publish する。serializer
+  # process の起動失敗・初期化失敗 (例: broken PYTHONIOENCODING) は
+  # Python 側が rc 1 で stdout 空になり得るため、そのまま返すと rc1/empty
+  # stdout の契約違反になる。rc 0/1 かつ valid JSON のときのみ publish し、
+  # それ以外は rc2・stdout 空へ正規化する。validator 用 python3 自体が
+  # 壊れている場合も validation 失敗として rc2 になる (正しい)。
+  if { [ "$_json_rc" -eq 0 ] || [ "$_json_rc" -eq 1 ]; } \
+    && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+      "$_DOCTOR_TMP/serializer-out.json" 2>/dev/null; then
+    cat "$_DOCTOR_TMP/serializer-out.json" || _doctor_fatal "failed to publish machine-readable report"
     exit "$_json_rc"
+  else
+    # serializer の stderr (concise 診断) があれば引き継ぐ。なければ
+    # 汎用メッセージを出す。stdout には何も出さない。
+    if [ -s "$_DOCTOR_TMP/serializer-err.txt" ]; then
+      cat "$_DOCTOR_TMP/serializer-err.txt" >&2 || true
+    else
+      printf 'doctor: serializer failed (rc %s)\n' "$_json_rc" >&2
+    fi
+    exit 2
   fi
 fi
 
