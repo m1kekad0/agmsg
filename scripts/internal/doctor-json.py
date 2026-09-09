@@ -24,38 +24,52 @@ empty project is installation-wide (global) and keeps its type. Global
 components live in top-level `global_components` (each carrying its own
 `type`); `scopes[].project` is therefore always non-empty -- no fake
 empty-project scope is ever synthesized.
+
+Store strictness (P1-3): each store file has an exact field width
+(scopes 4 / regs 6 / comps 8 / findings 11). Short/long rows are rejected
+(rc 2, stdout empty) -- padding/truncation is forbidden. Scoped children
+(registrations, scoped components, scoped findings) must belong to an
+existing scopes.tsv (project,type); child records never synthesize scopes.
+Duplicate scope rows are rejected (rc 2); at minimum conflicting duplicates
+are always rejected.
+
+Global opaque instances (P1-6): comps/findings carry a trailing opaque ID
+(global_instanceN). Non-empty opaque means {"kind":"opaque","id":...},
+distinguishing multiple global components sharing one id. Raw PID/hash/URL/
+socket/path never appear as structured instance IDs.
 """
 import argparse
 import json
 import sys
 
 
-def _read_tsv(path, width):
+def _read_tsv(path, width, name):
     rows = []
     try:
         with open(path, encoding="utf-8") as f:
-            for line in f:
+            for lineno, line in enumerate(f, start=1):
                 line = line.rstrip("\n")
                 if not line:
                     continue
+                # Strict: no newline stripping beyond the terminator (a raw
+                # newline inside a field would have split rows already and
+                # surfaces here as a width mismatch). CR must not appear
+                # (input-boundary rejection in Bash); a stray CR also fails
+                # closed here rather than silently surviving.
+                if "\r" in line:
+                    raise ValueError(
+                        f"{name}:{lineno} carries a carriage return")
                 parts = line.split("\x1f")
-                while len(parts) < width:
-                    parts.append("")
-                rows.append(parts[:width])
+                if len(parts) != width:
+                    raise ValueError(
+                        f"{name}:{lineno} has {len(parts)} fields, "
+                        f"expected {width}")
+                rows.append(parts)
     except OSError as exc:
         print(f"agmsg: doctor --json: cannot read scan store ({exc})",
               file=sys.stderr)
         sys.exit(2)
     return rows
-
-
-def _ensure_scope(order, regs, comps, findings, delivery, key):
-    if key not in delivery:
-        order.append(key)
-        regs[key] = []
-        comps[key] = []
-        findings[key] = []
-        delivery[key] = {"mode": "", "status": "unknown"}
 
 
 def _reject_noscope(row):
@@ -67,13 +81,28 @@ def _reject_noscope(row):
     raise ValueError(f"scoped record has no project: {row!r}")
 
 
-def _target(kind, team, agent, comp):
+def _reject_orphan(kind, row):
+    # A scoped child (registration / scoped component / scoped finding)
+    # whose (project,type) has no scopes.tsv entry is an internal
+    # inconsistency: child records must never synthesize scopes. Fail
+    # closed (rc 2) rather than inventing an unknown scope.
+    raise ValueError(f"{kind} without scope: {row!r}")
+
+
+def _reject_duplicate_scope(key):
+    raise ValueError(f"duplicate scope: {key!r}")
+
+
+def _target(kind, team, agent, comp, opaque=""):
     if kind == "registration":
         return {"kind": "registration", "team": team, "agent": agent}
     if kind == "component":
         instance = None
-        if team or agent:
-            instance = {"kind": "registration", "team": team, "agent": agent}
+        if opaque:
+            instance = {"kind": "opaque", "id": opaque}
+        elif team or agent:
+            instance = {"kind": "registration", "team": team,
+                        "agent": agent}
         return {"kind": "component", "component_id": comp,
                 "instance": instance}
     if kind:
@@ -96,49 +125,58 @@ def main():
     parser.add_argument("--teams", required=True, type=int)
     args = parser.parse_args()
 
-    scope_rows = _read_tsv(args.scopes, 4)
-    reg_rows = _read_tsv(args.registrations, 6)
-    comp_rows = _read_tsv(args.components, 7)
-    finding_rows = _read_tsv(args.findings, 10)
+    scope_rows = _read_tsv(args.scopes, 4, "scopes.tsv")
+    reg_rows = _read_tsv(args.registrations, 6, "regs.tsv")
+    comp_rows = _read_tsv(args.components, 8, "comps.tsv")
+    finding_rows = _read_tsv(args.findings, 11, "findings.tsv")
 
     # Group observations by scope in first-seen order. Only scopes.tsv rows
-    # (always carrying a real project) and non-empty-project records can
-    # create scopes[] entries; empty-project records are installation-wide.
+    # (always carrying a real project) create scopes[] entries; scoped
+    # children must reference an existing scope, empty-project records are
+    # installation-wide.
     order = []
     regs = {}
     comps = {}
     findings = {}
     delivery = {}
+    seen_scopes = set()
     for dproj, stype, mode, dstatus in scope_rows:
         if not dproj:
             _reject_noscope((dproj, stype, mode, dstatus))
         key = (dproj, stype)
-        if key not in delivery:
-            order.append(key)
-            regs[key] = []
-            comps[key] = []
-            findings[key] = []
-            delivery[key] = {"mode": mode, "status": dstatus}
+        if key in seen_scopes:
+            _reject_duplicate_scope(key)
+        seen_scopes.add(key)
+        order.append(key)
+        regs[key] = []
+        comps[key] = []
+        findings[key] = []
+        delivery[key] = {"mode": mode, "status": dstatus}
     for dproj, stype, team, agent, lock, watcher in reg_rows:
         if not dproj:
             _reject_noscope((dproj, stype, team, agent, lock, watcher))
         key = (dproj, stype)
-        _ensure_scope(order, regs, comps, findings, delivery, key)
+        if key not in delivery:
+            _reject_orphan("registration",
+                           (dproj, stype, team, agent, lock, watcher))
         regs[key].append({"team": team, "agent": agent, "lock": lock,
                           "watcher": watcher or None})
-    # One component object per (scope, id, instance); signals keep
+    # One component object per (scope, id, instance, opaque); signals keep
     # collection order. Empty-project components are installation-wide and
     # collected into global_components (each carrying its own type).
+    # Opaque IDs keep distinct underlying instances distinct (P1-6).
     comp_index = {}
     global_comp_index = {}
     global_components = []
-    for dproj, stype, comp, iteam, iagent, scode, sstatus in comp_rows:
+    for dproj, stype, comp, iteam, iagent, scode, sstatus, opaque in comp_rows:
         instance = None
-        if iteam or iagent:
+        if opaque:
+            instance = {"kind": "opaque", "id": opaque}
+        elif iteam or iagent:
             instance = {"kind": "registration", "team": iteam,
                         "agent": iagent}
         if not dproj:
-            gkey = (stype, comp, iteam, iagent)
+            gkey = (stype, comp, iteam, iagent, opaque)
             if gkey not in global_comp_index:
                 entry = {"id": comp, "type": stype, "instance": instance,
                          "signals": []}
@@ -148,8 +186,11 @@ def main():
                                                        "status": sstatus})
             continue
         key = (dproj, stype)
-        _ensure_scope(order, regs, comps, findings, delivery, key)
-        ckey = (key, comp, iteam, iagent)
+        if key not in delivery:
+            _reject_orphan("component",
+                           (dproj, stype, comp, iteam, iagent,
+                            scode, sstatus, opaque))
+        ckey = (key, comp, iteam, iagent, opaque)
         if ckey not in comp_index:
             entry = {"id": comp, "instance": instance, "signals": []}
             comp_index[ckey] = entry
@@ -158,18 +199,19 @@ def main():
                                             "status": sstatus})
     for row in finding_rows:
         (code, kind, category, dproj, stype, tkind, tteam, tagent, tcomp,
-         evidence) = row
+         evidence, opaque) = row
         finding = {
             "code": code,
             "kind": kind,
             "category": category,
             "scope": {"project": dproj or None, "type": stype or None},
-            "target": _target(tkind, tteam, tagent, tcomp),
+            "target": _target(tkind, tteam, tagent, tcomp, opaque),
             "evidence": evidence,
         }
         if dproj:
             key = (dproj, stype)
-            _ensure_scope(order, regs, comps, findings, delivery, key)
+            if key not in delivery:
+                _reject_orphan("finding", row)
             findings[key].append(finding)
         else:
             findings.setdefault(None, []).append(finding)
@@ -235,6 +277,10 @@ def _entrypoint():
     # once, so a failure can never leave a partial JSON document behind.
     try:
         return main()
+    except SystemExit as exc:
+        # _read_tsv OSError path already exits 2 with stderr; a bare
+        # `return` here would turn it into rc 0. Re-raise to preserve it.
+        raise
     except Exception as exc:
         print(f"agmsg: doctor --json: serializer failed ({exc})",
               file=sys.stderr)

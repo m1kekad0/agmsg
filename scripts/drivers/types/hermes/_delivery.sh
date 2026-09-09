@@ -10,8 +10,15 @@
 # Nothing to write — manual-only, so no hooks_file is resolved or created.
 agmsg_delivery_apply() { :; }
 
-# No hook file to read; the mode is always off.
-agmsg_delivery_status() { echo "mode: off"; }
+# No hook file to read; the mode is always off (evaluator が SSOT, P1-4)。
+agmsg_delivery_status() {
+  if command -v agmsg_delivery_eval_mode >/dev/null 2>&1; then
+    agmsg_delivery_eval_mode "$1" "$2" || return 1
+    echo "mode: $AGMSG_DELIVERY_EVAL_MODE"
+  else
+    echo "mode: off"
+  fi
+}
 
 # No watcher or bridge of our own. Do NOT fall through to the default teardown
 # (which stops this project's watch.sh) — another agent type may hold a live
