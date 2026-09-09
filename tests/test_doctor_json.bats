@@ -1367,3 +1367,160 @@ EOF
     fail_assert "rc 2 must leave stdout empty (unit separator)"
   fi
 }
+
+# --- Astra P1: serializer publish boundary + evaluator stdout isolation -----
+
+@test "doctor --json: serializer startup failure is rc 2 with empty stdout" {
+  # Broken stdio codec breaks the serializer process itself (rc 1, empty
+  # stdout from Python). The publish boundary must normalize this to rc 2,
+  # never pass through rc 1 with an empty stdout.
+  configured_off "$PROJ"
+  local rc=0
+  PYTHONIOENCODING=review_nonexistent_codec bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for serializer startup failure, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (serializer startup failure)"
+  fi
+  if [ ! -s "$TEST_SKILL_DIR/err.txt" ]; then
+    fail_assert "rc 2 must explain on stderr"
+  fi
+}
+
+@test "doctor --json: evaluator stdout noise never pollutes stdout" {
+  # Machine evaluators must not contract stdout: stray prints stay on
+  # stderr while the JSON payload stays a single pure line.
+  configured_off "$PROJ"
+  cp "$SCRIPTS/lib/delivery-eval.sh" "$TEST_SKILL_DIR/delivery-eval.sh.real"
+  python3 - "$SCRIPTS/lib/delivery-eval.sh" <<'EOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "agmsg_delivery_eval_watchers() {\n  AGMSG_DELIVERY_EVAL_WATCH_ALIVE=0"
+new = "agmsg_delivery_eval_watchers() {\n  echo EVALUATOR_NOISE\n  AGMSG_DELIVERY_EVAL_WATCH_ALIVE=0"
+assert s.count(old) == 1, "evaluator injection point not found"
+open(p, "w").write(s.replace(old, new))
+EOF
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  cp "$TEST_SKILL_DIR/delivery-eval.sh.real" "$SCRIPTS/lib/delivery-eval.sh"
+  if [ "$rc" -ne 0 ]; then
+    fail_assert "expected rc 0 with noisy evaluator, got $rc"
+  fi
+  if grep -q "EVALUATOR_NOISE" "$TEST_SKILL_DIR/out.txt"; then
+    fail_assert "evaluator noise polluted JSON stdout"
+  fi
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TEST_SKILL_DIR/out.txt"
+  if [ "$(wc -l < "$TEST_SKILL_DIR/out.txt" | tr -d ' ')" != "1" ]; then
+    fail_assert "JSON stdout must stay a single line"
+  fi
+}
+
+# --- Astra P1: store append failures are fatal, never false healthy ----------
+
+install_chmod_plug() {
+  # $1: comps|findings — chmod 400 that store, then write to it. The write
+  # must fatalize (rc 2) instead of degrading to a healthy-looking report
+  # with the record missing.
+  local which="$1"
+  cat > "$TYPES/claude-code/_doctor.sh" <<EOF
+[ -n "\${_AGMSG_CHMOD_SH:-}" ] && return 0
+_AGMSG_CHMOD_SH=1
+agmsg_doctor_extra_collect() {
+  if [ "$which" = "comps" ]; then
+    chmod 400 "\$_DOCTOR_COMPS_FILE"
+    agmsg_doctor_component_signal "\$2" "\$1" fixture "" "" process running
+  else
+    chmod 400 "\$_DOCTOR_FINDINGS_FILE"
+    agmsg_doctor_finding_add fixture_fail condition runtime "\$2" "\$1" "" "" "" "" "fixture" ""
+  fi
+  return 0
+}
+agmsg_doctor_extra_global_collect() { return 0; }
+EOF
+}
+
+@test "doctor --json: components store append failure is rc 2 with empty stdout" {
+  install_chmod_plug comps
+  configured_off "$PROJ"
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for components append failure, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (components append failure)"
+  fi
+}
+
+@test "doctor --json: findings store append failure is rc 2 with empty stdout" {
+  install_chmod_plug findings
+  configured_off "$PROJ"
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for findings append failure, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (findings append failure)"
+  fi
+}
+
+# --- Astra P2: raw validation happens before conversion -----------------------
+
+install_trailing_nl_plug() {
+  # NOTE: the trailing newline is built with $'\n' concatenation, never via
+  # $(...) which would strip it before the code under test even runs.
+  cat > "$TYPES/claude-code/_doctor.sh" <<'EOF'
+[ -n "${_AGMSG_TRAILNL_SH:-}" ] && return 0
+_AGMSG_TRAILNL_SH=1
+agmsg_doctor_extra_collect() {
+  local nl=$'\n'
+  agmsg_doctor_finding_add ev_trail condition runtime "" "claude-code" "" "" "" "" "line1$nl" ""
+  return 0
+}
+agmsg_doctor_extra_global_collect() { return 0; }
+EOF
+}
+
+@test "doctor --json: evidence trailing newline is rc 2, never stripped" {
+  install_trailing_nl_plug
+  configured_off "$PROJ"
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$PROJ" --type claude-code >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for trailing-newline evidence, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (trailing newline)"
+  fi
+}
+
+@test "doctor --json --redacted: project with CR is rc 2 fail-closed" {
+  local crproj="$TEST_SKILL_DIR/$(printf 'cr\rproj')"
+  mkdir -p "$crproj"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$crproj" >/dev/null
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$crproj" --type claude-code --redacted >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for CR project with --redacted, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (CR project)"
+  fi
+}
+
+@test "doctor --json --redacted: project with unit separator is rc 2 fail-closed" {
+  local usproj="$TEST_SKILL_DIR/$(printf 'us\037proj')"
+  mkdir -p "$usproj"
+  bash "$SCRIPTS/join.sh" team alice claude-code "$usproj" >/dev/null
+  local rc=0
+  bash "$SCRIPTS/doctor.sh" --json --project "$usproj" --type claude-code --redacted >"$TEST_SKILL_DIR/out.txt" 2>"$TEST_SKILL_DIR/err.txt" || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    fail_assert "expected rc 2 for unit-separator project with --redacted, got $rc"
+  fi
+  if [ -s "$TEST_SKILL_DIR/out.txt" ]; then
+    fail_assert "rc 2 must leave stdout empty (unit separator project)"
+  fi
+}
