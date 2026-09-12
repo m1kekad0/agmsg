@@ -696,6 +696,68 @@ write_orphan_appserver() {
   assert_json_python 'any(c["id"]=="codex_app_server" and c["type"]=="codex" and c["instance"] is not None and c["instance"].get("kind")=="opaque" for c in d["global_components"])' 'missing global codex_app_server component'
 }
 
+@test "doctor --json: codex untracked live app-server is a global opaque finding" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  local _pid
+  _pid="$(confirmed_pid)"
+  # The process-table seam (see test_helper): one "pid args" line the scan
+  # matches, while no record file anywhere claims the pid.
+  printf '%s %s\n' "$_pid" "fakecodex app-server --listen ws://127.0.0.1:0" >> "$AGMSG_DOCTOR_PS_SNAPSHOT"
+
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for untracked process, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'any(f["code"]=="codex_process_untracked" and f["scope"]=={"project": None, "type": "codex"} and f["target"]["kind"]=="component" and f["target"]["component_id"]=="codex_app_server" for f in d["global_findings"])' 'missing global codex_process_untracked finding'
+  assert_json_python 'any(c["id"]=="codex_app_server" and c["type"]=="codex" and c["instance"] is not None and c["instance"].get("kind")=="opaque" and any(s=={"code": "process", "status": "untracked-live"} for s in c["signals"]) for c in d["global_components"])' 'missing untracked-live component signal'
+}
+
+@test "doctor --json: codex stale dispatcher lock is a scoped component finding" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  local _h _dead
+  _h="$(proj_hash "$PROJ")"
+  _dead="$(dead_pid)"
+  ( export SKILL_DIR="$TEST_SKILL_DIR"
+    . "$SCRIPTS/lib/storage.sh"
+    agmsg_runtime_lock_acquire "codex-dispatcher:$_h" "$_dead" >/dev/null 2>&1 )
+
+  run_json --project "$PROJ" --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for stale dispatcher lock, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'any(f["code"]=="codex_dispatcher_lock_stale" and f["target"]["kind"]=="component" and f["target"]["component_id"]=="codex_dispatcher" for f in d["scopes"][0]["findings"])' 'missing codex_dispatcher_lock_stale finding'
+  assert_json_python 'any(c["id"]=="codex_dispatcher" and any(s=={"code": "lock", "status": "held-stale"} for s in c["signals"]) for c in d["scopes"][0]["components"])' 'missing codex_dispatcher lock=held-stale signal'
+}
+
+@test "doctor --json: codex orphan seat is a scoped-nameless global component, never a warning" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  {
+    echo "session=thread-gone"
+    echo "name=gone-role"
+    echo "team=gone"
+    echo "agent=role"
+    echo "type=codex"
+    echo "project=$PROJ"
+  } > "$TEST_SKILL_DIR/run/role-session.gone__role"
+
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 0 ]; then
+    fail_assert "orphan seat must not warn, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_eq '["global_findings"]' "[]"
+  assert_json_python 'any(c["id"]=="codex_role_session" and c["instance"]=={"kind": "registration", "team": "gone", "agent": "role"} and any(s=={"code": "seat", "status": "orphan"} for s in c["signals"]) for c in d["global_components"])' 'missing orphan seat component'
+}
+
 # --- collector failure: diagnostic_failure, never empty-stdout rc 1 ---------
 
 install_failing_plug() {

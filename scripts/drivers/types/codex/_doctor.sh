@@ -33,10 +33,11 @@ _AGMSG_CODEX_DOCTOR_SH=1
 : "${RUN_DIR:?codex _doctor.sh requires RUN_DIR}"
 : "${SCRIPT_DIR:?codex _doctor.sh requires SCRIPT_DIR}"
 
-# agmsg_sha1 (lib/hash.sh) and the role-session readers are the helpers
-# doctor.sh does not already load — liveness, cmdline, canonical paths, and
-# the project registry all arrive via doctor.sh's own sources. Pure function
-# definitions, so sourcing here is free of side effects.
+# agmsg_sha1 (lib/hash.sh), the role-session readers, and the runtime-lock
+# readers are the helpers doctor.sh does not already load — liveness, cmdline,
+# canonical paths, and the project registry all arrive via doctor.sh's own
+# sources. Pure function definitions, so sourcing here is free of side
+# effects.
 if ! command -v agmsg_sha1 >/dev/null 2>&1; then
   # shellcheck disable=SC1091
   . "$SKILL_DIR/scripts/lib/hash.sh"
@@ -44,6 +45,10 @@ fi
 if ! command -v agmsg_role_session_load >/dev/null 2>&1; then
   # shellcheck disable=SC1091
   . "$SKILL_DIR/scripts/lib/role-session.sh"
+fi
+if ! command -v agmsg_runtime_lock_owner >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  . "$SKILL_DIR/scripts/lib/storage.sh"
 fi
 
 # Scope context for one collector run, set by the entry points below. The
@@ -208,9 +213,12 @@ _codex_doctor_hash_known() {
 # that names a project). $3 (optional) is the opaque global instance ID
 # (P1-6) for the unattributed case; empty for the per-pair scope singleton.
 # Registers display lines and structured findings through the collector
-# helpers above.
+# helpers above. Sets _CODEX_DOCTOR_EVAL_PID_STATE to the pid verdict
+# (empty when no record triple exists at all) so the caller can correlate
+# two records that resolve to the same project.
 _codex_doctor_eval_appserver() {
   local hash="$1" attributed="$2" opaque="${3:-}"
+  _CODEX_DOCTOR_EVAL_PID_STATE=""
   # Global orphan without an explicit opaque: derive one from the hash so
   # multiple orphans never collide into a single null-instance component
   # (P1-6) and raw hashes never reach evidence (P1-5).
@@ -261,6 +269,7 @@ _codex_doctor_eval_appserver() {
         ;;
     esac
   fi
+  _CODEX_DOCTOR_EVAL_PID_STATE="$pid_state"
 
   # --- endpoint signal. Responsive proves a listener, never ownership.
   local ep_state="none" url=""
@@ -518,10 +527,13 @@ _codex_doctor_registered_pairs() {
 # Project-independent signals only — liveness, bound-endpoint responsiveness,
 # and seat-set membership. A thread outside the recorded set is a note, never
 # a verdict: seats predate the record format and removed roles leave none.
+#
+# $1 is the registered-pair union already computed by the caller (shared with
+# the orphan-seat pass so neither recomputes the installation's pair set).
 _codex_doctor_global_bindings() {
   local tab pair_union pidf key bridge_pid bound_url bound_thread bound_port seated _gopaque _gdisplay
   tab="$(printf '\t')"
-  pair_union="$(_codex_doctor_registered_pairs)"
+  pair_union="$1"
   for pidf in "$RUN_DIR"/codex-bridge.*.pid; do
     [ -f "$pidf" ] || continue
     key="${pidf##*/codex-bridge.}"
@@ -530,13 +542,30 @@ _codex_doctor_global_bindings() {
     case $'\n'"$pair_union"$'\n' in
       *$'\n'"${key%%.*}${tab}${key#*.}"$'\n'*) continue ;;
     esac
+    bridge_pid="$(_codex_doctor_read_record "$pidf")"
     # Keys without launcher sidecars belong to delivery.sh's own per-role
-    # verdicts (see the per-pair comment above) — judging them here too would
-    # double-report.
+    # verdicts (see the per-pair comment above) WHEN their role is still
+    # registered — those keys never reach this line. A key reaching here
+    # without sidecars is claimed by nobody: judge liveness only, since
+    # there is no binding to compare and nothing else ever will.
     if [ ! -f "$RUN_DIR/codex-bridge.$key.appserver" ] && [ ! -f "$RUN_DIR/codex-bridge.$key.thread" ]; then
+      _codex_doctor_opaque_for "$key"
+      _gopaque="$_CODEX_OPAQUE_OUT"
+      if [ -n "$bridge_pid" ] && _agmsg_pid_valid "$bridge_pid" 2>/dev/null \
+        && _agmsg_pid_alive "$bridge_pid" 2>/dev/null; then
+        _codex_doctor_display "Codex bridge: $_gopaque alive (pid $bridge_pid) but no registered role claims its key (ambiguous — a dropped role's bridge may not have exited yet)"
+        _codex_doctor_signal codex_bridge "" "" process "running" "$_gopaque"
+        _codex_doctor_signal codex_bridge "" "" endpoint "unknown" "$_gopaque"
+        _codex_doctor_signal codex_bridge "" "" seat "unknown" "$_gopaque"
+      else
+        _codex_doctor_display "Codex bridge: $_gopaque not running (pid '${bridge_pid:-empty}')"
+        _codex_doctor_warn codex_bridge_stale_pidfile "" "" codex_bridge "stale bridge pidfile ($_gopaque, pid '${bridge_pid:-empty}' not running)" "$_gopaque"
+        _codex_doctor_signal codex_bridge "" "" process "not-running" "$_gopaque"
+        _codex_doctor_signal codex_bridge "" "" endpoint "unknown" "$_gopaque"
+        _codex_doctor_signal codex_bridge "" "" seat "unknown" "$_gopaque"
+      fi
       continue
     fi
-    bridge_pid="$(_codex_doctor_read_record "$pidf")"
     bound_url="$(_codex_doctor_read_record "$RUN_DIR/codex-bridge.$key.appserver")"
     bound_thread="$(_codex_doctor_read_record "$RUN_DIR/codex-bridge.$key.thread")"
     [ -n "$bound_thread" ] && agmsg_doctor_note_secret "$bound_thread"
@@ -589,18 +618,284 @@ _codex_doctor_global_bindings() {
   return 0
 }
 
+# Live `codex app-server` processes as "pid<TAB>args" lines. Read-only: a
+# single `ps` snapshot (never a signal). AGMSG_DOCTOR_PS_SNAPSHOT substitutes
+# a fixture file — the real process table is neither deterministic nor safe
+# to depend on in tests. rc 1 means the scan itself is unavailable; callers
+# degrade to a note rather than guessing.
+_codex_doctor_process_scan() {
+  local raw
+  if [ -n "${AGMSG_DOCTOR_PS_SNAPSHOT:-}" ]; then
+    [ -f "$AGMSG_DOCTOR_PS_SNAPSHOT" ] || return 1
+    raw="$(cat "$AGMSG_DOCTOR_PS_SNAPSHOT" 2>/dev/null || true)"
+  else
+    command -v ps >/dev/null 2>&1 || return 1
+    raw="$(ps -eo pid=,args= 2>/dev/null)" || return 1
+  fi
+  local pid args
+  while read -r pid args || [ -n "$pid$args" ]; do
+    _agmsg_pid_valid "$pid" 2>/dev/null || continue
+    case "$args" in
+      *codex*app-server*) ;;
+      *) continue ;;
+    esac
+    [ "$pid" = "$$" ] && continue
+    printf '%s\t%s\n' "$pid" "$args"
+  done <<EOF
+$raw
+EOF
+  return 0
+}
+
+# Live app-server processes no record triple in this install claims — the
+# untracked-orphan case of Issue #5. $1 is the newline-separated set of pids
+# already read from every codex-app-server.*.pid file (known hashes included,
+# so a healthy tracked server is never flagged). A live-but-untracked pid is
+# ambiguous: a manual `codex app-server`, another install's server, or a
+# leaked launch. Reported as a warning so the leftover is visible, with no
+# attribution invented and nothing suggested beyond manual verification.
+_codex_doctor_untracked_processes() {
+  local recorded_pids="$1" scan spid sargs
+  if ! scan="$(_codex_doctor_process_scan)"; then
+    _codex_doctor_display "Codex app-server process scan unavailable (untracked-process check skipped)"
+    return 0
+  fi
+  while IFS="$(printf '\t')" read -r spid sargs; do
+    [ -n "$spid" ] || continue
+    case $'\n'"$recorded_pids"$'\n' in
+      *$'\n'"$spid"$'\n'*) continue ;;
+    esac
+    # The snapshot can be stale (or a fixture): only a pid still live now is
+    # a finding.
+    _agmsg_pid_alive_local "$spid" 2>/dev/null || continue
+    _codex_doctor_opaque_for "appserver-pid:$spid"
+    _codex_doctor_display "Codex app-server process: pid $spid is live but no record tracks it ($_CODEX_OPAQUE_OUT)"
+    _codex_doctor_warn codex_process_untracked "" "" codex_app_server \
+      "live Codex app-server process pid $spid is not tracked by any record in this install (a manual 'codex app-server' or another install may own it — ambiguous; verify before stopping)" \
+      "$_CODEX_OPAQUE_OUT"
+    _codex_doctor_signal codex_app_server "" "" process "untracked-live" "$_CODEX_OPAQUE_OUT"
+  done <<< "$scan"
+  return 0
+}
+
+# Orphan role-session records: a seat whose (team, agent) no registration
+# holds is a routine post-drop leftover, but it still occupies its thread in
+# the seated set — which changes how a missing bridge gets explained.
+# Surfaced as advisory state, not a warning: the record is safe to remove by
+# hand and nothing here proves it should be.
+_codex_doctor_orphan_seats() {
+  local pair_union="$1" tab f rtype rteam ragent rteam_d ragent_d rsess
+  tab="$(printf '\t')"
+  for f in "$RUN_DIR"/role-session.*; do
+    [ -f "$f" ] || continue
+    rtype="$(_agmsg_role_session_field "$f" type)"
+    [ "$rtype" = "codex" ] || continue
+    rteam="$(_agmsg_role_session_field "$f" team)"
+    ragent="$(_agmsg_role_session_field "$f" agent)"
+    [ -n "$rteam" ] && [ -n "$ragent" ] || continue
+    case $'\n'"$pair_union"$'\n' in
+      *$'\n'"${rteam}${tab}${ragent}"$'\n'*) continue ;;
+    esac
+    # Same secret-table hygiene as the bound-thread read above: this seat's
+    # session id is never printed, but masking it keeps any other line that
+    # happens to carry it safe under --redacted.
+    rsess="$(_agmsg_role_session_field "$f" session)"
+    [ -n "$rsess" ] && agmsg_doctor_note_secret "$rsess"
+    # Register pseudonyms before the display line is built: names absent from
+    # the registration store were never _redact_*-mapped, so under
+    # --redacted they would otherwise reach the line raw.
+    if command -v _redact_team >/dev/null 2>&1; then
+      _redact_team "$rteam"; rteam_d="$_REDACT_OUT"
+      _redact_agent "$ragent"; ragent_d="$_REDACT_OUT"
+    else
+      rteam_d="$rteam"; ragent_d="$ragent"
+    fi
+    _codex_doctor_display "Codex role-session: $rteam_d/$ragent_d holds a seat record but no registration (advisory leftover — still occupies its thread in the seated set)"
+    _codex_doctor_signal codex_role_session "$rteam" "$ragent" seat "orphan" ""
+  done
+  return 0
+}
+
+# The optional PATH shim (~/.agents/bin/codex) routes interactive launches
+# through the monitor for monitor-mode projects. Install-global state, so it
+# is diagnosed here rather than per pair. Read-only: file reads, a grep for
+# the shim marker, and `command -v` resolution — nothing is executed through
+# the shim itself.
+_codex_doctor_shim_check() {
+  local shim_bin="$HOME/.agents/bin/codex"
+  local marker="Optional Codex entrypoint shim for agmsg monitor mode"
+  local codex_dir="$SKILL_DIR/scripts/drivers/types/codex"
+  local owner="" resolved=""
+  if [ ! -f "$shim_bin" ]; then
+    _codex_doctor_display "Codex shim: not installed ($shim_bin absent; optional — the shell function or codex-monitor.sh can also route monitor launches)"
+    _codex_doctor_signal codex_shim "" "" install "absent" ""
+    return 0
+  fi
+  if ! grep -q "$marker" "$shim_bin" 2>/dev/null; then
+    _codex_doctor_display "Codex shim: $shim_bin exists but is not an agmsg shim — left untouched, and it does not route through this install"
+    _codex_doctor_signal codex_shim "" "" install "foreign-file" ""
+    return 0
+  fi
+  # The installer stamps `# agmsg-shim-owner: <quoted dir>` so an installed
+  # shim can be attributed to one agmsg checkout; pre-stamp shims are
+  # attributed to nothing and stay "unknown".
+  owner="$(sed -n 's/^# agmsg-shim-owner: //p' "$shim_bin" 2>/dev/null | head -1)"
+  if [ -z "$owner" ]; then
+    _codex_doctor_display "Codex shim: installed ($shim_bin), owner unknown (predates ownership tracking)"
+    _codex_doctor_signal codex_shim "" "" owner "legacy-unknown" ""
+  elif [ "$owner" = "$(printf '%q' "$codex_dir")" ]; then
+    if [ -f "$codex_dir/codex-shim.sh" ] && [ -f "$SKILL_DIR/scripts/delivery.sh" ]; then
+      _codex_doctor_display "Codex shim: installed ($shim_bin), owned by this install, dispatch target intact"
+      _codex_doctor_signal codex_shim "" "" owner "self" ""
+    else
+      _codex_doctor_display "Codex shim: installed ($shim_bin), owned by this install, but its dispatch target is incomplete"
+      _codex_doctor_signal codex_shim "" "" owner "self" ""
+      _codex_doctor_warn codex_shim_broken_target "" "" codex_shim \
+        "codex shim $shim_bin points at this install but the driver directory is missing pieces (codex-shim.sh or delivery.sh); launches through the shim fall back to plain codex" ""
+    fi
+  else
+    _codex_doctor_display "Codex shim: installed ($shim_bin), owned by a different agmsg install ($owner)"
+    _codex_doctor_signal codex_shim "" "" owner "foreign" ""
+    _codex_doctor_warn codex_shim_foreign_owner "" "" codex_shim \
+      "codex shim $shim_bin is owned by a different agmsg install ($owner); every codex launch through it dispatches into that install's storage and drivers" ""
+  fi
+  # PATH effectiveness: `codex` resolving elsewhere only means the PATH shim
+  # is not the entrypoint — a shell function (invisible from this subshell)
+  # may still route launches, so this is a note, never a warning. Same
+  # conservatism as delivery.sh's own shim-path note.
+  resolved="$(command -v codex 2>/dev/null || true)"
+  if [ -z "$resolved" ]; then
+    _codex_doctor_display "Codex shim PATH: 'codex' is not on PATH in this shell"
+    _codex_doctor_signal codex_shim "" "" path_effect "no-codex" ""
+  elif [ "$resolved" = "$shim_bin" ]; then
+    _codex_doctor_display "Codex shim PATH: 'codex' resolves to the shim (PATH-effective)"
+    _codex_doctor_signal codex_shim "" "" path_effect "effective" ""
+  elif [ -f "$resolved" ] && grep -q "$marker" "$resolved" 2>/dev/null; then
+    _codex_doctor_display "Codex shim PATH: 'codex' resolves to a different agmsg shim ($resolved)"
+    _codex_doctor_signal codex_shim "" "" path_effect "other-shim" ""
+  else
+    case "$resolved" in
+      */*)
+        _codex_doctor_display "Codex shim PATH: 'codex' resolves to $resolved, not the shim — a shell function may still route launches (unverifiable from here)"
+        _codex_doctor_signal codex_shim "" "" path_effect "shadowed" "" ;;
+      *)
+        _codex_doctor_display "Codex shim PATH: 'codex' resolves to a non-path ($resolved)"
+        _codex_doctor_signal codex_shim "" "" path_effect "non-path" "" ;;
+    esac
+  fi
+  return 0
+}
+
+# One runtime-lock observation (launcher dispatcher / role child). Locks live
+# in the runtime store's `locks` table — read-only here: never acquire or
+# release, and the caller guarantees the db file already exists (sqlite3
+# creates an empty file on open, so even a SELECT on a missing path would be
+# a write). A dead-owner row is stale evidence of an unclean exit — the next
+# monitor launch CAS-reclaims it (acquire_runtime_lock), so it is reported,
+# not treated as a blocker.
+_codex_doctor_eval_lock() {
+  local resource="$1" label="$2" team="$3" agent="$4" comp="$5" code="$6" owner
+  owner="$(agmsg_runtime_lock_owner "$resource" 2>/dev/null || true)"
+  if [ -z "$owner" ]; then
+    _codex_doctor_signal "$comp" "$team" "$agent" lock "none" ""
+    return 0
+  fi
+  # _local: the owner pid is a launcher shell's $$, minted in the MSYS pid
+  # space under Git Bash — same choice acquire_runtime_lock makes (#567).
+  if _agmsg_pid_alive_local "$owner" 2>/dev/null; then
+    _codex_doctor_display "Codex $label lock: held by live pid $owner"
+    _codex_doctor_signal "$comp" "$team" "$agent" lock "held-alive" ""
+    return 0
+  fi
+  _codex_doctor_display "Codex $label lock: held by dead pid $owner"
+  _codex_doctor_signal "$comp" "$team" "$agent" lock "held-stale" ""
+  _codex_doctor_warn "$code" "$team" "$agent" "$comp" \
+    "stale $label lock (owner pid $owner not running); reclaimed automatically on the next monitor launch" ""
+  return 0
+}
+
+# Runtime-lock state for this project: one dispatcher lock per project hash,
+# one child lock per registered role (codex-bridge-launcher.sh). Silent when
+# the runtime store does not exist at all — monitor never ran here. $2 and
+# $3 are the registered-spelling and canonical-spelling project hashes: the
+# launcher hashes whichever spelling it was launched under, so a lock can sit
+# under either.
+_codex_doctor_pair_locks() {
+  local project="$1" hash="$2" canon_hash="${3:-}" db
+  command -v agmsg_runtime_lock_owner >/dev/null 2>&1 || return 0
+  db="$(_agmsg_runtime_db_path 2>/dev/null || true)"
+  [ -n "$db" ] && [ -f "$db" ] || return 0
+  local _h team name child_res tab _seen_hashes=""
+  tab="$(printf '\t')"
+  for _h in "$hash" "$canon_hash"; do
+    [ -n "$_h" ] || continue
+    case " $_seen_hashes " in *" $_h "*) continue ;; esac
+    _seen_hashes="${_seen_hashes}${_h} "
+    _codex_doctor_eval_lock "codex-dispatcher:$_h" "dispatcher" "" "" \
+      codex_dispatcher codex_dispatcher_lock_stale
+    while IFS="$tab" read -r team name; do
+      [ -n "$team" ] && [ -n "$name" ] || continue
+      child_res="codex-child:$_h:$(printf '%s' "${team}${tab}${name}" | agmsg_sha1 2>/dev/null)"
+      _codex_doctor_eval_lock "$child_res" "bridge-launcher child" "$team" "$name" \
+        codex_child codex_child_lock_stale
+    done <<< "$("$SCRIPT_DIR/identities.sh" "$project" codex 2>/dev/null || true)"
+  done
+  return 0
+}
+
 agmsg_doctor_extra_collect() {
   local type="$1" project="$2"
   [ "$type" = "codex" ] || return 0
   _CODEX_DOCTOR_SCOPE_PROJECT="$project"
   _CODEX_DOCTOR_SCOPE_TYPE="$type"
   _CODEX_DOCTOR_DISPLAY_MODE="pair"
-  local hash port_raw
+  local hash port_raw canon canon_hash _raw_pid_state="" _canon_pid_state=""
+  local _raw_has=0 _canon_has=0
   hash="$(printf '%s' "$project" | agmsg_sha1 2>/dev/null || true)"
   [ -n "$hash" ] || return 0
-  _codex_doctor_eval_appserver "$hash" 1
+  # Canonical-spelling fallback: the monitor hashes the logical path it was
+  # launched with, while a registration can hold another spelling of the
+  # same directory (symlinked vs physical — /var vs /private/var on macOS).
+  # A record under the canonical hash is otherwise seen by NO scan: the
+  # global pass already counts it among the known hashes and skips it.
+  canon="$(agmsg_canonical_path "$project" 2>/dev/null || printf '%s' "$project")"
+  canon_hash=""
+  if [ "$canon" != "$project" ]; then
+    canon_hash="$(printf '%s' "$canon" | agmsg_sha1 2>/dev/null || true)"
+  fi
+  if [ -f "$RUN_DIR/codex-app-server.$hash.pid" ] \
+    || [ -f "$RUN_DIR/codex-app-server.$hash.port" ] \
+    || [ -f "$RUN_DIR/codex-app-server.$hash.version" ]; then
+    _raw_has=1
+  fi
+  if [ -n "$canon_hash" ] && [ "$canon_hash" != "$hash" ] \
+    && { [ -f "$RUN_DIR/codex-app-server.$canon_hash.pid" ] \
+      || [ -f "$RUN_DIR/codex-app-server.$canon_hash.port" ] \
+      || [ -f "$RUN_DIR/codex-app-server.$canon_hash.version" ]; }; then
+    _canon_has=1
+  fi
+  # Evaluate the canonical-spelling record first when it exists so the raw
+  # hash's "no record" line never contradicts a record that is really there.
+  if [ "$_canon_has" -eq 1 ]; then
+    _codex_doctor_display "Codex app-server: a record set exists under this project's canonical spelling"
+    _codex_doctor_eval_appserver "$canon_hash" 1
+    _canon_pid_state="$_CODEX_DOCTOR_EVAL_PID_STATE"
+  fi
+  if [ "$_raw_has" -eq 1 ] || [ "$_canon_has" -eq 0 ]; then
+    _codex_doctor_eval_appserver "$hash" 1
+    _raw_pid_state="$_CODEX_DOCTOR_EVAL_PID_STATE"
+  fi
+  if [ "$_raw_pid_state" = "alive-confirmed" ] \
+    && [ "$_canon_pid_state" = "alive-confirmed" ]; then
+    _codex_doctor_warn codex_records_duplicate "" "" codex_app_server \
+      "two app-server record sets (registered and canonical spellings) both hold live pids for this project — a duplicate server pair" ""
+  fi
   port_raw="$(_codex_doctor_read_record "$RUN_DIR/codex-app-server.$hash.port")"
+  if [ -z "$port_raw" ] && [ -n "$canon_hash" ]; then
+    port_raw="$(_codex_doctor_read_record "$RUN_DIR/codex-app-server.$canon_hash.port")"
+  fi
   _codex_doctor_pair_bindings "$project" "$port_raw"
+  _codex_doctor_pair_locks "$project" "$hash" "$canon_hash"
   return 0
 }
 
@@ -610,7 +905,16 @@ agmsg_doctor_extra_global_collect() {
   _CODEX_DOCTOR_SCOPE_PROJECT=""
   _CODEX_DOCTOR_SCOPE_TYPE="$type"
   _CODEX_DOCTOR_DISPLAY_MODE="global"
+  _codex_doctor_shim_check
   _codex_doctor_known_hashes
+  # Pids claimed by every record file — known hashes included — so the
+  # untracked-process scan below never flags a healthy tracked server.
+  local recorded_pids="" _pf _rp
+  for _pf in "$RUN_DIR"/codex-app-server.*.pid; do
+    [ -f "$_pf" ] || continue
+    _rp="$(_codex_doctor_read_record "$_pf")"
+    [ -n "$_rp" ] && recorded_pids="${recorded_pids}${_rp}"$'\n'
+  done
   # Hashes from every record kind, not just pidfiles: the monitor writes the
   # pid record first and every cleanup path removes pid/port/version
   # together, so a port/version record without a pid is never a normal
@@ -626,7 +930,7 @@ agmsg_doctor_extra_global_collect() {
   # while the launcher-owned sidecars wait to be overwritten, so that shape
   # is the ordinary post-TUI-close state — reporting it would warn on every
   # cleanly closed session with no actionable signal behind it.
-  local recf base hash seen_hashes="" _opaque
+  local recf base hash seen_hashes="" _opaque pair_union
   for recf in "$RUN_DIR"/codex-app-server.*.pid \
              "$RUN_DIR"/codex-app-server.*.port \
              "$RUN_DIR"/codex-app-server.*.version; do
@@ -647,7 +951,10 @@ agmsg_doctor_extra_global_collect() {
     _codex_doctor_display "Codex app-server record '$_opaque' matches no registered project (unknown — not attributed)"
     _codex_doctor_eval_appserver "$hash" 0 "$_opaque"
   done
-  _codex_doctor_global_bindings
+  _codex_doctor_untracked_processes "$recorded_pids"
+  pair_union="$(_codex_doctor_registered_pairs)"
+  _codex_doctor_global_bindings "$pair_union"
+  _codex_doctor_orphan_seats "$pair_union"
   return 0
 }
 
