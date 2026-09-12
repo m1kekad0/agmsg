@@ -735,6 +735,34 @@ write_orphan_appserver() {
   assert_json_python 'any(c["id"]=="codex_dispatcher" and any(s=={"code": "lock", "status": "held-stale"} for s in c["signals"]) for c in d["scopes"][0]["components"])' 'missing codex_dispatcher lock=held-stale signal'
 }
 
+@test "doctor --json: codex lock under the canonical spelling is one aggregated signal" {
+  # A symlinked registration: the lock resource lives under the physical
+  # path's hash while the scope hash is the link spelling. Both spellings
+  # name one logical lock, so the component must carry exactly one lock
+  # signal — lock=none next to lock=held-stale would be undecidable.
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team alice codex "$_link" >/dev/null
+  configured_off "$_link"
+  local _phys _dead
+  _phys="$(cd "$_link" && pwd -P)"
+  _dead="$(dead_pid)"
+  ( export SKILL_DIR="$TEST_SKILL_DIR"
+    . "$SCRIPTS/lib/storage.sh"
+    agmsg_runtime_lock_acquire "codex-dispatcher:$(proj_hash "$_phys")" "$_dead" >/dev/null 2>&1 )
+
+  run_json --project "$_link" --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for stale dispatcher lock, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'sum(1 for c in d["scopes"][0]["components"] if c["id"]=="codex_dispatcher" for s in c["signals"] if s["code"]=="lock") == 1' 'expected exactly one aggregated lock signal'
+  assert_json_python 'any(c["id"]=="codex_dispatcher" and any(s=={"code": "lock", "status": "held-stale"} for s in c["signals"]) for c in d["scopes"][0]["components"])' 'missing aggregated held-stale signal'
+  assert_json_python 'sum(1 for f in d["scopes"][0]["findings"] if f["code"]=="codex_dispatcher_lock_stale") == 1' 'expected exactly one stale-lock finding'
+}
+
 @test "doctor --json: codex orphan seat is a scoped-nameless global component, never a warning" {
   bash "$SCRIPTS/leave.sh" team alice >/dev/null
   bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null

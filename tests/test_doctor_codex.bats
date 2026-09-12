@@ -529,6 +529,103 @@ snapshot_codex_process() { # $1=pid
   out_has "stale bridge-launcher child lock"
 }
 
+@test "doctor codex: a codex client argv containing 'app-server' is not an app-server" {
+  # `codex exec "investigate app-server"` reaches ps as bare words — a
+  # substring match would flag the Codex client itself as an app-server.
+  local _pid
+  _pid="$(foreign_pid)"
+  printf '%s %s\n' "$_pid" "fakecodex exec investigate app-server" >> "$AGMSG_DOCTOR_PS_SNAPSHOT"
+
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 0 ]
+  out_lacks "no record tracks it"
+  out_has "no warnings."
+}
+
+@test "doctor codex: recorded pid running a codex client subcommand is foreign" {
+  # The pidfile's pid is alive but its argv is `codex exec ... app-server`,
+  # not `codex app-server` — pid reuse, not a live server.
+  local _pid
+  bash -c 'exec -a "fakecodex exec investigate app-server" sleep 60' >/dev/null 2>&1 3>&- 4>&- &
+  _pid=$!
+  track_pid "$_pid"
+  write_appserver "$PROJ" "$_pid" "1" "codex-cli 9.9.9-test"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
+  [ "$status" -eq 1 ]
+  out_has "pid $_pid alive but is not a Codex app-server"
+}
+
+@test "doctor codex: dispatcher lock under the canonical spelling is still found" {
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team bob codex "$_link" >/dev/null
+  local _phys _dead
+  _phys="$(cd "$_link" && pwd -P)"
+  _dead="$(dead_pid)"
+  acquire_lock "codex-dispatcher:$(proj_hash "$_phys")" "$_dead"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$_link" --type codex
+  [ "$status" -eq 1 ]
+  out_has "Codex dispatcher lock: held by dead pid $_dead"
+  out_has "stale dispatcher lock (owner pid $_dead not running)"
+}
+
+@test "doctor codex: locks under both spellings aggregate into one verdict" {
+  # A live owner under one spelling and a dead row under the other are one
+  # logical lock: the line reports both owners, the verdict is a single
+  # held-alive, and the stale row still warns.
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team bob codex "$_link" >/dev/null
+  local _phys _dead
+  _phys="$(cd "$_link" && pwd -P)"
+  _dead="$(dead_pid)"
+  acquire_lock "codex-dispatcher:$(proj_hash "$_link")" "$$"
+  acquire_lock "codex-dispatcher:$(proj_hash "$_phys")" "$_dead"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$_link" --type codex
+  [ "$status" -eq 1 ]
+  out_has "Codex dispatcher lock: held by live pid $$; held by dead pid $_dead"
+  out_has "stale dispatcher lock (owner pid $_dead not running)"
+}
+
+@test "doctor codex: bridge binding compares against the live spelling's endpoint" {
+  # Registered spelling holds a stale record while the canonical spelling
+  # holds the live server — a bridge bound to the live endpoint must not
+  # read as stale.
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team bob codex "$_link" >/dev/null
+  local _phys _live_port _live_pid _dead _bpid
+  _phys="$(cd "$_link" && pwd -P)"
+  _live_port="$(start_listener "$TEST_SKILL_DIR/port.txt")"
+  _live_pid="$(confirmed_pid)"
+  _dead="$(dead_pid)"
+  write_appserver "$_link" "$_dead" "1" "codex-cli 9.9.9-test"
+  write_appserver "$_phys" "$_live_pid" "$_live_port" "codex-cli 9.9.9-test"
+  _bpid="$(foreign_pid)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$_bpid" > "$TEST_SKILL_DIR/run/codex-bridge.team.bob.pid"
+  {
+    echo "pid=$_bpid"
+    echo "project=$_link"
+    echo "identities=team/bob"
+    echo "type=codex"
+  } > "$TEST_SKILL_DIR/run/codex-bridge.team.bob.meta"
+  printf '%s' "ws://127.0.0.1:$_live_port" > "$TEST_SKILL_DIR/run/codex-bridge.team.bob.appserver"
+  printf '%s' "thread-x" > "$TEST_SKILL_DIR/run/codex-bridge.team.bob.thread"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$_link" --type codex
+  # The stale raw-spelling record still warns; the binding must not.
+  [ "$status" -eq 1 ]
+  out_has "app-server=match"
+  out_lacks "bound to a stale app-server"
+}
+
 @test "doctor codex: bridge pidfile for a dropped role warns when dead, notes when alive" {
   local _dead
   _dead="$(dead_pid)"

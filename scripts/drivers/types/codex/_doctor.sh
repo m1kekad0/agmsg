@@ -207,6 +207,25 @@ _codex_doctor_hash_known() {
   return 1
 }
 
+# Is $1 a `codex app-server` command line? `app-server` must be the
+# subcommand — the token immediately after the codex binary — not a
+# substring anywhere in the arguments: a live `codex exec "investigate
+# app-server"` would otherwise read as an app-server (quotes never reach
+# ps output, so the inner words are indistinguishable from real tokens).
+_codex_doctor_is_appserver_args() {
+  local bin="${1%%[[:space:]]*}" rest
+  case "$bin" in
+    *codex*) ;;
+    *) return 1 ;;
+  esac
+  rest="${1#"$bin"}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  case "$rest" in
+    "app-server"|"app-server"[[:space:]]*) return 0 ;;
+  esac
+  return 1
+}
+
 # Evaluate one app-server record triple by project hash. $2 is 1 when the hash
 # is attributed to a known project (per-pair call: relaunch advice applies)
 # and 0 when it is not (global call: unknown/ambiguous framing, no advice
@@ -258,16 +277,13 @@ _codex_doctor_eval_appserver() {
     pid_state="dead"
   else
     cmdline="$(compat_get_cmdline "$pid_raw" 2>/dev/null || true)"
-    case "$cmdline" in
-      *codex*app-server*) pid_state="alive-confirmed" ;;
-      *)
-        if [ -z "$cmdline" ]; then
-          pid_state="alive-unverified"
-        else
-          pid_state="alive-foreign"
-        fi
-        ;;
-    esac
+    if _codex_doctor_is_appserver_args "$cmdline"; then
+      pid_state="alive-confirmed"
+    elif [ -z "$cmdline" ]; then
+      pid_state="alive-unverified"
+    else
+      pid_state="alive-foreign"
+    fi
   fi
   _CODEX_DOCTOR_EVAL_PID_STATE="$pid_state"
 
@@ -635,10 +651,7 @@ _codex_doctor_process_scan() {
   local pid args
   while read -r pid args || [ -n "$pid$args" ]; do
     _agmsg_pid_valid "$pid" 2>/dev/null || continue
-    case "$args" in
-      *codex*app-server*) ;;
-      *) continue ;;
-    esac
+    _codex_doctor_is_appserver_args "$args" || continue
     [ "$pid" = "$$" ] && continue
     printf '%s\t%s\n' "$pid" "$args"
   done <<EOF
@@ -786,31 +799,57 @@ _codex_doctor_shim_check() {
   return 0
 }
 
-# One runtime-lock observation (launcher dispatcher / role child). Locks live
+# One logical runtime lock (launcher dispatcher / role child), evaluated
+# across every lock resource the project-hash spellings can name. Locks live
 # in the runtime store's `locks` table — read-only here: never acquire or
 # release, and the caller guarantees the db file already exists (sqlite3
 # creates an empty file on open, so even a SELECT on a missing path would be
-# a write). A dead-owner row is stale evidence of an unclean exit — the next
-# monitor launch CAS-reclaims it (acquire_runtime_lock), so it is reported,
-# not treated as a blocker.
-_codex_doctor_eval_lock() {
-  local resource="$1" label="$2" team="$3" agent="$4" comp="$5" code="$6" owner
-  owner="$(agmsg_runtime_lock_owner "$resource" 2>/dev/null || true)"
-  if [ -z "$owner" ]; then
+# a write). The spellings name ONE logical lock — a second launch under the
+# other spelling would block on the first's lock — so their owner rows are
+# aggregated into a single verdict: emitting two states on one component
+# would leave consumers unable to tell which is current. A dead-owner row is
+# stale evidence of an unclean exit — the next monitor launch CAS-reclaims
+# it (acquire_runtime_lock) — so it is reported, not treated as a blocker.
+_codex_doctor_eval_locks() {
+  local label="$1" team="$2" agent="$3" comp="$4" code="$5"
+  shift 5
+  local res owner alive="" dead="" _pw
+  for res in "$@"; do
+    [ -n "$res" ] || continue
+    owner="$(agmsg_runtime_lock_owner "$res" 2>/dev/null || true)"
+    [ -n "$owner" ] || continue
+    # _local: the owner pid is a launcher shell's $$, minted in the MSYS pid
+    # space under Git Bash — same choice acquire_runtime_lock makes (#567).
+    if _agmsg_pid_alive_local "$owner" 2>/dev/null; then
+      alive="${alive:+$alive }$owner"
+    else
+      dead="${dead:+$dead }$owner"
+    fi
+  done
+  if [ -z "$alive$dead" ]; then
     _codex_doctor_signal "$comp" "$team" "$agent" lock "none" ""
     return 0
   fi
-  # _local: the owner pid is a launcher shell's $$, minted in the MSYS pid
-  # space under Git Bash — same choice acquire_runtime_lock makes (#567).
-  if _agmsg_pid_alive_local "$owner" 2>/dev/null; then
-    _codex_doctor_display "Codex $label lock: held by live pid $owner"
-    _codex_doctor_signal "$comp" "$team" "$agent" lock "held-alive" ""
-    return 0
+  local msg=""
+  if [ -n "$alive" ]; then
+    _pw="pid"; case "$alive" in *" "*) _pw="pids" ;; esac
+    msg="held by live $_pw $alive"
   fi
-  _codex_doctor_display "Codex $label lock: held by dead pid $owner"
-  _codex_doctor_signal "$comp" "$team" "$agent" lock "held-stale" ""
-  _codex_doctor_warn "$code" "$team" "$agent" "$comp" \
-    "stale $label lock (owner pid $owner not running); reclaimed automatically on the next monitor launch" ""
+  if [ -n "$dead" ]; then
+    _pw="pid"; case "$dead" in *" "*) _pw="pids" ;; esac
+    msg="${msg:+$msg; }held by dead $_pw $dead"
+  fi
+  _codex_doctor_display "Codex $label lock: $msg"
+  if [ -n "$alive" ]; then
+    _codex_doctor_signal "$comp" "$team" "$agent" lock "held-alive" ""
+  else
+    _codex_doctor_signal "$comp" "$team" "$agent" lock "held-stale" ""
+  fi
+  if [ -n "$dead" ]; then
+    _pw="pid"; case "$dead" in *" "*) _pw="pids" ;; esac
+    _codex_doctor_warn "$code" "$team" "$agent" "$comp" \
+      "stale $label lock (owner $_pw $dead not running); reclaimed automatically on the next monitor launch" ""
+  fi
   return 0
 }
 
@@ -819,27 +858,31 @@ _codex_doctor_eval_lock() {
 # the runtime store does not exist at all — monitor never ran here. $2 and
 # $3 are the registered-spelling and canonical-spelling project hashes: the
 # launcher hashes whichever spelling it was launched under, so a lock can sit
-# under either.
+# under either — both resources are passed to the aggregation above, which
+# emits one verdict per component.
 _codex_doctor_pair_locks() {
   local project="$1" hash="$2" canon_hash="${3:-}" db
   command -v agmsg_runtime_lock_owner >/dev/null 2>&1 || return 0
   db="$(_agmsg_runtime_db_path 2>/dev/null || true)"
   [ -n "$db" ] && [ -f "$db" ] || return 0
-  local _h team name child_res tab _seen_hashes=""
+  local team name tab child_res alt
   tab="$(printf '\t')"
-  for _h in "$hash" "$canon_hash"; do
-    [ -n "$_h" ] || continue
-    case " $_seen_hashes " in *" $_h "*) continue ;; esac
-    _seen_hashes="${_seen_hashes}${_h} "
-    _codex_doctor_eval_lock "codex-dispatcher:$_h" "dispatcher" "" "" \
-      codex_dispatcher codex_dispatcher_lock_stale
-    while IFS="$tab" read -r team name; do
-      [ -n "$team" ] && [ -n "$name" ] || continue
-      child_res="codex-child:$_h:$(printf '%s' "${team}${tab}${name}" | agmsg_sha1 2>/dev/null)"
-      _codex_doctor_eval_lock "$child_res" "bridge-launcher child" "$team" "$name" \
-        codex_child codex_child_lock_stale
-    done <<< "$("$SCRIPT_DIR/identities.sh" "$project" codex 2>/dev/null || true)"
-  done
+  alt=""
+  if [ -n "$canon_hash" ] && [ "$canon_hash" != "$hash" ]; then
+    alt="codex-dispatcher:$canon_hash"
+  fi
+  _codex_doctor_eval_locks "dispatcher" "" "" codex_dispatcher \
+    codex_dispatcher_lock_stale "codex-dispatcher:$hash" "$alt"
+  while IFS="$tab" read -r team name; do
+    [ -n "$team" ] && [ -n "$name" ] || continue
+    child_res="$(printf '%s' "${team}${tab}${name}" | agmsg_sha1 2>/dev/null)"
+    alt=""
+    if [ -n "$canon_hash" ] && [ "$canon_hash" != "$hash" ]; then
+      alt="codex-child:$canon_hash:$child_res"
+    fi
+    _codex_doctor_eval_locks "bridge-launcher child" "$team" "$name" \
+      codex_child codex_child_lock_stale "codex-child:$hash:$child_res" "$alt"
+  done <<< "$("$SCRIPT_DIR/identities.sh" "$project" codex 2>/dev/null || true)"
   return 0
 }
 
@@ -890,10 +933,33 @@ agmsg_doctor_extra_collect() {
     _codex_doctor_warn codex_records_duplicate "" "" codex_app_server \
       "two app-server record sets (registered and canonical spellings) both hold live pids for this project — a duplicate server pair" ""
   fi
-  port_raw="$(_codex_doctor_read_record "$RUN_DIR/codex-app-server.$hash.port")"
-  if [ -z "$port_raw" ] && [ -n "$canon_hash" ]; then
-    port_raw="$(_codex_doctor_read_record "$RUN_DIR/codex-app-server.$canon_hash.port")"
+  # The "current" endpoint a bridge binding is compared against must come
+  # from the record that evaluated live. With records under both spellings
+  # and exactly one live record, that record's port is current; when neither
+  # (or both) is live there is no single current endpoint — leaving the
+  # comparison unknown beats comparing bridges against a stale spelling.
+  local _sel=""
+  if [ "$_raw_has" -eq 1 ] && [ "$_canon_has" -eq 1 ]; then
+    local _raw_live=0 _canon_live=0
+    case "$_raw_pid_state" in alive-confirmed|alive-unverified) _raw_live=1 ;; esac
+    case "$_canon_pid_state" in alive-confirmed|alive-unverified) _canon_live=1 ;; esac
+    if [ "$_raw_live" -eq 1 ] && [ "$_canon_live" -eq 0 ]; then
+      _sel=raw
+    elif [ "$_canon_live" -eq 1 ] && [ "$_raw_live" -eq 0 ]; then
+      _sel=canon
+    else
+      _codex_doctor_display "Codex app-server endpoint: records under both spellings cannot be disambiguated — current endpoint unknown"
+    fi
+  elif [ "$_canon_has" -eq 1 ]; then
+    _sel=canon
+  else
+    _sel=raw
   fi
+  port_raw=""
+  case "$_sel" in
+    raw) port_raw="$(_codex_doctor_read_record "$RUN_DIR/codex-app-server.$hash.port")" ;;
+    canon) port_raw="$(_codex_doctor_read_record "$RUN_DIR/codex-app-server.$canon_hash.port")" ;;
+  esac
   _codex_doctor_pair_bindings "$project" "$port_raw"
   _codex_doctor_pair_locks "$project" "$hash" "$canon_hash"
   return 0
