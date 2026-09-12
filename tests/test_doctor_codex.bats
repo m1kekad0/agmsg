@@ -46,6 +46,18 @@ teardown() {
 
 track_pid() { printf '%s\n' "$1" >> "$TEST_SKILL_DIR/fixpids"; }
 
+# Enforced output assertions. A bare [[ ]] anywhere but a body's last line
+# reports `ok` unchecked on macOS bash 3.2 (#670) and the enforced-assertions
+# baseline may only shrink, so substring checks go through grep -qF — an
+# ordinary pipeline errexit enforces on every bash.
+out_has()   { printf '%s\n' "$output" | grep -qF "$1"; }
+out_lacks() {
+  if printf '%s\n' "$output" | grep -qF "$1"; then
+    echo "unexpected output fragment: $1" >&2
+    return 1
+  fi
+}
+
 # A pid that is provably dead by construction (spawn, wait, reuse the freed
 # pid) rather than a hardcoded guess a CI runner might actually have live.
 dead_pid() {
@@ -127,10 +139,10 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Codex app-server: healthy (pid $_pid, ws://127.0.0.1:$_port"* ]]
-  [[ "$output" != *"stale app-server"* ]]
-  [[ "$output" != *"version drift"* ]]
-  [[ "$output" == *"no warnings."* ]]
+  out_has "Codex app-server: healthy (pid $_pid, ws://127.0.0.1:$_port"
+  out_lacks "stale app-server"
+  out_lacks "version drift"
+  out_has "no warnings."
 }
 
 @test "doctor codex: dead pid plus silent port warns independently, and never suggests killing" {
@@ -140,10 +152,10 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"stale app-server pidfile (pid $_dead not running)"* ]]
-  [[ "$output" == *"app-server endpoint is unresponsive (ws://127.0.0.1:64321)"* ]]
+  out_has "stale app-server pidfile (pid $_dead not running)"
+  out_has "app-server endpoint is unresponsive (ws://127.0.0.1:64321)"
   # Each signal stands on its own: two independent warnings, no kill language.
-  [[ "$output" != *"kill"* ]]
+  out_lacks "kill"
   # Read-only proof: the records are still there, byte for byte.
   [ "$(cat "$TEST_SKILL_DIR/run/codex-app-server.$(proj_hash "$PROJ").pid")" = "$_dead" ]
   [ -f "$TEST_SKILL_DIR/run/codex-app-server.$(proj_hash "$PROJ").port" ]
@@ -157,8 +169,8 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"pid $_foreign alive but is not a Codex app-server (possible pid reuse)"* ]]
-  [[ "$output" != *"kill"* ]]
+  out_has "pid $_foreign alive but is not a Codex app-server (possible pid reuse)"
+  out_lacks "kill"
   # The foreign process survived the diagnosis.
   kill -0 "$_foreign"
 }
@@ -168,8 +180,8 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"stale app-server pid record (invalid pid 'not-a-pid')"* ]]
-  [[ "$output" == *"stale app-server endpoint record (invalid port '99999')"* ]]
+  out_has "stale app-server pid record (invalid pid 'not-a-pid')"
+  out_has "stale app-server endpoint record (invalid port '99999')"
 }
 
 @test "doctor codex: version drift warns with relaunch advice, never a stale/kill verdict" {
@@ -181,10 +193,10 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"app-server version drift (recorded 'codex-cli 0.145.0', current 'codex-cli 9.9.9-test')"* ]]
-  [[ "$output" == *"relaunch Codex through the monitor"* ]]
-  [[ "$output" != *"stale app-server pidfile"* ]]
-  [[ "$output" != *"kill"* ]]
+  out_has "app-server version drift (recorded 'codex-cli 0.145.0', current 'codex-cli 9.9.9-test')"
+  out_has "relaunch Codex through the monitor"
+  out_lacks "stale app-server pidfile"
+  out_lacks "kill"
   # The drifted server itself is untouched.
   kill -0 "$_pid"
 }
@@ -198,7 +210,7 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"endpoint ws://127.0.0.1:$_port answers but no live recorded server owns it"* ]]
+  out_has "endpoint ws://127.0.0.1:$_port answers but no live recorded server owns it"
 }
 
 @test "doctor codex: two healthy app-servers for different projects are not duplicates" {
@@ -215,8 +227,8 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --type codex
   [ "$status" -eq 0 ]
-  [[ "$output" != *"duplicate"* ]]
-  [[ "$output" == *"no warnings."* ]]
+  out_lacks "duplicate"
+  out_has "no warnings."
 }
 
 @test "doctor codex: a record matching no registered project is unknown, never attributed" {
@@ -230,10 +242,10 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"matches no registered project (unknown — not attributed)"* ]]
-  [[ "$output" == *"stale app-server pidfile (pid $_dead not running)"* ]]
-  [[ "$output" == *"owning project unknown"* ]]
-  [[ "$output" != *"relaunch Codex through the monitor"* ]]
+  out_has "matches no registered project (unknown — not attributed)"
+  out_has "stale app-server pidfile (pid $_dead not running)"
+  out_has "owning project unknown"
+  out_lacks "relaunch Codex through the monitor"
 }
 
 @test "doctor codex: bridge bound to a stale app-server warns with both endpoints" {
@@ -252,7 +264,7 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"bridge team.alice is bound to a stale app-server (bound 'ws://127.0.0.1:1', current 'ws://127.0.0.1:$_port')"* ]]
+  out_has "bridge team.alice is bound to a stale app-server (bound 'ws://127.0.0.1:1', current 'ws://127.0.0.1:$_port')"
   kill -0 "$_bpid"
 }
 
@@ -280,8 +292,8 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 0 ]
-  [[ "$output" == *"app-server=match, thread=match"* ]]
-  [[ "$output" != *"WARN"* ]]
+  out_has "app-server=match, thread=match"
+  out_lacks "WARN"
 }
 
 @test "doctor codex: stale launcher-generation bridge pidfile warns once" {
@@ -295,7 +307,7 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"stale bridge pidfile (team.alice, pid '$_dead' not running)"* ]]
+  out_has "stale bridge pidfile (team.alice, pid '$_dead' not running)"
   local _count
   _count="$(printf '%s\n' "$output" | grep -c "stale bridge pidfile (team.alice")"
   [ "$_count" -eq 1 ]
@@ -312,11 +324,11 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$_home_proj" --type codex --redacted
   [ "$status" -eq 1 ]
-  [[ "$output" == *"team1/agent1"* ]]
-  [[ "$output" != *"team/alice"* ]]
-  [[ "$output" != *"team.alice"* ]]
+  out_has "team1/agent1"
+  out_lacks "team/alice"
+  out_lacks "team.alice"
   # The home-relative project reads as ~/..., never as the raw $HOME path.
-  [[ "$output" != *"$HOME"* ]]
+  out_lacks "$HOME"
 }
 
 @test "doctor codex: zero registrations plus leftover records still surface globally when unfiltered" {
@@ -332,10 +344,10 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"0 team(s), 0 registration(s),"* ]]
-  [[ "$output" == *"matches no registered project (unknown — not attributed)"* ]]
-  [[ "$output" == *"stale app-server pidfile (pid $_dead not running)"* ]]
-  [[ "$output" == *"app-server endpoint is unresponsive (ws://127.0.0.1:64325)"* ]]
+  out_has "0 team(s), 0 registration(s),"
+  out_has "matches no registered project (unknown — not attributed)"
+  out_has "stale app-server pidfile (pid $_dead not running)"
+  out_has "app-server endpoint is unresponsive (ws://127.0.0.1:64325)"
 }
 
 @test "doctor codex: port/version records without a pid are an incomplete state, not invisible" {
@@ -349,8 +361,8 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"matches no registered project (unknown — not attributed)"* ]]
-  [[ "$output" == *"app-server endpoint record exists but the pid record is missing (incomplete state)"* ]]
+  out_has "matches no registered project (unknown — not attributed)"
+  out_has "app-server endpoint record exists but the pid record is missing (incomplete state)"
   # The leftover files are evidence, not trash for the doctor to take out.
   [ -f "$TEST_SKILL_DIR/run/codex-app-server.$_uh.port" ]
   [ -f "$TEST_SKILL_DIR/run/codex-app-server.$_uh.version" ]
@@ -369,7 +381,7 @@ write_bridge_meta() { # $1=key $2=pid $3=project
   # surface, not a filter that names something absent.
   run bash "$SCRIPTS/doctor.sh" --type codex
   [ "$status" -eq 2 ]
-  [[ "$output" == *"no registrations match this scope"* ]]
+  out_has "no registrations match this scope"
 }
 
 @test "doctor codex: version record alone, without pid and port, is incomplete" {
@@ -383,7 +395,7 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"version record exists but the pid and port records are missing (incomplete state)"* ]]
+  out_has "version record exists but the pid and port records are missing (incomplete state)"
   [ -f "$TEST_SKILL_DIR/run/codex-app-server.$_h.version" ]
 }
 
@@ -400,7 +412,7 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 1 ]
-  [[ "$output" == *"is alive but the port record is missing while a version record exists (incomplete state"* ]]
+  out_has "is alive but the port record is missing while a version record exists (incomplete state"
   kill -0 "$_pid"
 }
 
@@ -414,7 +426,270 @@ write_bridge_meta() { # $1=key $2=pid $3=project
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
   [ "$status" -eq 0 ]
-  [[ "$output" == *"no port record"* ]]
-  [[ "$output" == *"no warnings."* ]]
+  out_has "no port record"
+  out_has "no warnings."
   kill -0 "$_pid"
+}
+
+# --- Follow-up coverage: locks, canonical-spelling records, untracked
+# --- processes, unattributed bridges, orphan seats, shim -------------------
+
+# Acquire a runtime-lock row in the test store. Runs in a subshell so the
+# test shell keeps no storage.sh state; SKILL_DIR points at the isolated
+# install. Owner liveness is NOT checked by acquire — a dead owner_pid is
+# exactly the stale state under test.
+acquire_lock() { # $1=resource $2=owner_pid
+  ( export SKILL_DIR="$TEST_SKILL_DIR"
+    . "$SCRIPTS/lib/storage.sh"
+    agmsg_runtime_lock_acquire "$1" "$2" >/dev/null 2>&1 )
+}
+
+# A snapshot entry the process scan will match (args contain codex app-server).
+snapshot_codex_process() { # $1=pid
+  printf '%s %s\n' "$1" "fakecodex app-server --listen ws://127.0.0.1:0" >> "$AGMSG_DOCTOR_PS_SNAPSHOT"
+}
+
+@test "doctor codex: live app-server process no record tracks warns as ambiguous" {
+  local _pid
+  _pid="$(confirmed_pid)"
+  snapshot_codex_process "$_pid"
+
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 1 ]
+  out_has "pid $_pid is live but no record tracks it"
+  out_has "ambiguous"
+  out_lacks "kill"
+  # Read-only proof: the untracked process survived the diagnosis.
+  kill -0 "$_pid"
+}
+
+@test "doctor codex: a tracked app-server process is not flagged as untracked" {
+  local _port
+  _port="$(start_listener "$TEST_SKILL_DIR/port.txt")"
+  local _pid
+  _pid="$(confirmed_pid)"
+  write_appserver "$PROJ" "$_pid" "$_port" "codex-cli 9.9.9-test"
+  snapshot_codex_process "$_pid"
+
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 0 ]
+  out_lacks "no record tracks it"
+  out_has "no warnings."
+}
+
+@test "doctor codex: an unavailable process scan degrades to a note, not a verdict" {
+  AGMSG_DOCTOR_PS_SNAPSHOT="$TEST_SKILL_DIR/no-such-snapshot" \
+    run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 0 ]
+  out_has "process scan unavailable"
+  out_has "no warnings."
+}
+
+@test "doctor codex: stale dispatcher runtime lock warns; live lock reports held" {
+  local _h
+  _h="$(proj_hash "$PROJ")"
+  local _dead
+  _dead="$(dead_pid)"
+  acquire_lock "codex-dispatcher:$_h" "$_dead"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
+  [ "$status" -eq 1 ]
+  out_has "Codex dispatcher lock: held by dead pid $_dead"
+  out_has "stale dispatcher lock (owner pid $_dead not running)"
+  out_has "reclaimed automatically"
+}
+
+@test "doctor codex: live dispatcher and child locks report held without warnings" {
+  local _h
+  _h="$(proj_hash "$PROJ")"
+  acquire_lock "codex-dispatcher:$_h" "$$"
+  local _ch
+  _ch="$(printf '%s' "team	alice" | agmsg_sha1)"
+  acquire_lock "codex-child:$_h:$_ch" "$$"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
+  [ "$status" -eq 0 ]
+  out_has "Codex dispatcher lock: held by live pid $$"
+  out_has "Codex bridge-launcher child lock: held by live pid $$"
+  out_has "no warnings."
+}
+
+@test "doctor codex: stale role-child runtime lock names the role" {
+  local _h
+  _h="$(proj_hash "$PROJ")"
+  local _dead
+  _dead="$(dead_pid)"
+  local _ch
+  _ch="$(printf '%s' "team	alice" | agmsg_sha1)"
+  acquire_lock "codex-child:$_h:$_ch" "$_dead"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
+  [ "$status" -eq 1 ]
+  out_has "Codex bridge-launcher child lock: held by dead pid $_dead"
+  out_has "stale bridge-launcher child lock"
+}
+
+@test "doctor codex: bridge pidfile for a dropped role warns when dead, notes when alive" {
+  local _dead
+  _dead="$(dead_pid)"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$_dead" > "$TEST_SKILL_DIR/run/codex-bridge.gone.role.pid"
+
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 1 ]
+  out_has "not running (pid '$_dead')"
+  out_has "stale bridge pidfile"
+
+  local _live
+  _live="$(foreign_pid)"
+  printf '%s\n' "$_live" > "$TEST_SKILL_DIR/run/codex-bridge.gone.role.pid"
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 0 ]
+  out_has "alive (pid $_live) but no registered role claims its key"
+  out_has "ambiguous"
+  kill -0 "$_live"
+}
+
+@test "doctor codex: orphan role-session seat is advisory, not a warning" {
+  mkdir -p "$TEST_SKILL_DIR/run"
+  {
+    echo "session=thread-gone"
+    echo "name=gone-role"
+    echo "team=gone"
+    echo "agent=role"
+    echo "type=codex"
+    echo "project=$PROJ"
+  } > "$TEST_SKILL_DIR/run/role-session.gone__role"
+
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 0 ]
+  out_has "gone/role holds a seat record but no registration"
+  out_has "advisory"
+  out_has "no warnings."
+}
+
+@test "doctor codex: --redacted masks an orphan seat's unregistered names" {
+  mkdir -p "$TEST_SKILL_DIR/run"
+  {
+    echo "session=thread-gone"
+    echo "name=secrethandle-role"
+    echo "team=secrethandle"
+    echo "agent=role"
+    echo "type=codex"
+    echo "project=$PROJ"
+  } > "$TEST_SKILL_DIR/run/role-session.secrethandle__role"
+
+  run bash "$SCRIPTS/doctor.sh" --type codex --redacted
+  [ "$status" -eq 0 ]
+  out_lacks "secrethandle"
+  out_has "seat record but no registration"
+}
+
+@test "doctor codex: app-server record under the canonical project spelling is diagnosed" {
+  # A symlinked registration and a monitor launched through the physical
+  # spelling hash the same directory differently; the record must still be
+  # found, not silently skipped by both scans.
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team bob codex "$_link" >/dev/null
+  local _phys _pid _port
+  _phys="$(cd "$_link" && pwd -P)"
+  _port="$(start_listener "$TEST_SKILL_DIR/port.txt")"
+  _pid="$(confirmed_pid)"
+  write_appserver "$_phys" "$_pid" "$_port" "codex-cli 9.9.9-test"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$_link" --type codex
+  [ "$status" -eq 0 ]
+  out_has "canonical spelling"
+  out_has "healthy (pid $_pid"
+  out_has "no warnings."
+}
+
+@test "doctor codex: live records under both spellings of one project are a duplicate" {
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team bob codex "$_link" >/dev/null
+  local _phys _port1 _port2 _pid1 _pid2
+  _phys="$(cd "$_link" && pwd -P)"
+  _port1="$(start_listener "$TEST_SKILL_DIR/port1.txt")"
+  _port2="$(start_listener "$TEST_SKILL_DIR/port2.txt")"
+  _pid1="$(confirmed_pid)"
+  _pid2="$(confirmed_pid)"
+  write_appserver "$_link" "$_pid1" "$_port1" "codex-cli 9.9.9-test"
+  write_appserver "$_phys" "$_pid2" "$_port2" "codex-cli 9.9.9-test"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$_link" --type codex
+  [ "$status" -eq 1 ]
+  out_has "duplicate server pair"
+  # Both servers are evidence, not targets.
+  kill -0 "$_pid1"
+  kill -0 "$_pid2"
+}
+
+@test "doctor codex: shim absent is a note; foreign-owned and broken shims warn" {
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 0 ]
+  out_has "Codex shim: not installed"
+  out_has "no warnings."
+
+  # A shim owned by another install: launches through it dispatch into the
+  # wrong storage — a real misconfiguration, so it warns.
+  mkdir -p "$HOME/.agents/bin"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "# Optional Codex entrypoint shim for agmsg monitor mode"
+    echo "# agmsg-shim-owner: /other/install"
+    echo "exit 0"
+  } > "$HOME/.agents/bin/codex"
+  chmod +x "$HOME/.agents/bin/codex"
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 1 ]
+  out_has "owned by a different agmsg install"
+  out_has "dispatches into that install"
+}
+
+@test "doctor codex: shim owned by this install resolves through PATH quietly" {
+  mkdir -p "$HOME/.agents/bin"
+  local _owner
+  _owner="$(printf '%q' "$SCRIPTS/drivers/types/codex")"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "# Optional Codex entrypoint shim for agmsg monitor mode"
+    echo "# agmsg-shim-owner: $_owner"
+    echo "exit 0"
+  } > "$HOME/.agents/bin/codex"
+  chmod +x "$HOME/.agents/bin/codex"
+
+  PATH="$HOME/.agents/bin:$PATH" run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 0 ]
+  out_has "owned by this install"
+  out_has "PATH-effective"
+  out_has "no warnings."
+}
+
+@test "doctor codex: shim shadowed by another codex is a note, never a warning" {
+  mkdir -p "$HOME/.agents/bin"
+  local _owner
+  _owner="$(printf '%q' "$SCRIPTS/drivers/types/codex")"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "# Optional Codex entrypoint shim for agmsg monitor mode"
+    echo "# agmsg-shim-owner: $_owner"
+    echo "exit 0"
+  } > "$HOME/.agents/bin/codex"
+  chmod +x "$HOME/.agents/bin/codex"
+  # A non-shim codex earlier on PATH: the PATH shim is bypassed, but a shell
+  # function may still route launches — note only.
+  local _stubdir="$TEST_SKILL_DIR/codex-stub"
+  mkdir -p "$_stubdir"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$_stubdir/codex"
+  chmod +x "$_stubdir/codex"
+
+  PATH="$_stubdir:$PATH" run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 0 ]
+  out_has "not the shim"
+  out_lacks "codex_shim_"
+  out_has "no warnings."
 }
