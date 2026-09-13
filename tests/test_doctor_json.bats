@@ -696,6 +696,152 @@ write_orphan_appserver() {
   assert_json_python 'any(c["id"]=="codex_app_server" and c["type"]=="codex" and c["instance"] is not None and c["instance"].get("kind")=="opaque" for c in d["global_components"])' 'missing global codex_app_server component'
 }
 
+@test "doctor --json: codex untracked live app-server is a global opaque finding" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  local _pid
+  _pid="$(confirmed_pid)"
+  # The process-table seam (see test_helper): one "pid args" line the scan
+  # matches, while no record file anywhere claims the pid.
+  printf '%s %s\n' "$_pid" "fakecodex app-server --listen ws://127.0.0.1:0" >> "$AGMSG_DOCTOR_PS_SNAPSHOT"
+
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for untracked process, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'any(f["code"]=="codex_process_untracked" and f["scope"]=={"project": None, "type": "codex"} and f["target"]["kind"]=="component" and f["target"]["component_id"]=="codex_app_server" for f in d["global_findings"])' 'missing global codex_process_untracked finding'
+  assert_json_python 'any(c["id"]=="codex_app_server" and c["type"]=="codex" and c["instance"] is not None and c["instance"].get("kind")=="opaque" and any(s=={"code": "process", "status": "untracked-live"} for s in c["signals"]) for c in d["global_components"])' 'missing untracked-live component signal'
+}
+
+@test "doctor --json: untracked app-server evidence carries the opaque id, never the raw pid" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  local _pid
+  _pid="$(confirmed_pid)"
+  printf '%s %s\n' "$_pid" "fakecodex app-server --listen ws://127.0.0.1:0" >> "$AGMSG_DOCTOR_PS_SNAPSHOT"
+
+  # Global-component contract: raw host pids are represented by opaque ids
+  # only — unredacted evidence must not carry the number either.
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for untracked process, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_absent "$_pid" "raw pid in unredacted global finding"
+  assert_json_python 'any("global_instance" in f["evidence"] for f in d["global_findings"] if f["code"]=="codex_process_untracked")' 'untracked finding does not name the opaque instance'
+
+  run_json --type codex --redacted
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for untracked process (redacted), got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_absent "$_pid" "raw pid in redacted payload"
+}
+
+@test "doctor --json: codex stale dispatcher lock is a scoped component finding" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  local _h _dead
+  _h="$(proj_hash "$PROJ")"
+  _dead="$(dead_pid)"
+  ( export SKILL_DIR="$TEST_SKILL_DIR"
+    . "$SCRIPTS/lib/storage.sh"
+    agmsg_runtime_lock_acquire "codex-dispatcher:$_h" "$_dead" >/dev/null 2>&1 )
+
+  run_json --project "$PROJ" --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for stale dispatcher lock, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'any(f["code"]=="codex_dispatcher_lock_stale" and f["target"]["kind"]=="component" and f["target"]["component_id"]=="codex_dispatcher" for f in d["scopes"][0]["findings"])' 'missing codex_dispatcher_lock_stale finding'
+  assert_json_python 'any(c["id"]=="codex_dispatcher" and any(s=={"code": "lock", "status": "held-stale"} for s in c["signals"]) for c in d["scopes"][0]["components"])' 'missing codex_dispatcher lock=held-stale signal'
+}
+
+@test "doctor --json: codex lock under the canonical spelling is one aggregated signal" {
+  # A symlinked registration: the lock resource lives under the physical
+  # path's hash while the scope hash is the link spelling. Both spellings
+  # name one logical lock, so the component must carry exactly one lock
+  # signal — lock=none next to lock=held-stale would be undecidable.
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team alice codex "$_link" >/dev/null
+  configured_off "$_link"
+  local _phys _dead
+  _phys="$(cd "$_link" && pwd -P)"
+  _dead="$(dead_pid)"
+  ( export SKILL_DIR="$TEST_SKILL_DIR"
+    . "$SCRIPTS/lib/storage.sh"
+    agmsg_runtime_lock_acquire "codex-dispatcher:$(proj_hash "$_phys")" "$_dead" >/dev/null 2>&1 )
+
+  run_json --project "$_link" --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for stale dispatcher lock, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'sum(1 for c in d["scopes"][0]["components"] if c["id"]=="codex_dispatcher" for s in c["signals"] if s["code"]=="lock") == 1' 'expected exactly one aggregated lock signal'
+  assert_json_python 'any(c["id"]=="codex_dispatcher" and any(s=={"code": "lock", "status": "held-stale"} for s in c["signals"]) for c in d["scopes"][0]["components"])' 'missing aggregated held-stale signal'
+  assert_json_python 'sum(1 for f in d["scopes"][0]["findings"] if f["code"]=="codex_dispatcher_lock_stale") == 1' 'expected exactly one stale-lock finding'
+}
+
+@test "doctor --json: codex dual-spelling records are two components, not merged signals" {
+  # Registered spelling holds a dead record, canonical spelling the live
+  # server — both are real record sets, so each gets its own component
+  # instance instead of merging contradictory signals into one.
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team alice codex "$_link" >/dev/null
+  configured_off "$_link"
+  local _phys _live_port _live_pid _dead
+  _phys="$(cd "$_link" && pwd -P)"
+  _live_port="$(start_listener "$TEST_SKILL_DIR/port.txt")"
+  _live_pid="$(confirmed_pid)"
+  _dead="$(dead_pid)"
+  write_appserver "$_link" "$_dead" "1" "codex-cli 9.9.9-test"
+  write_appserver "$_phys" "$_live_pid" "$_live_port" "codex-cli 9.9.9-test"
+
+  run_json --project "$_link" --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for the stale record, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'sum(1 for c in d["scopes"][0]["components"] if c["id"]=="codex_app_server") == 2' 'expected two distinct codex_app_server components'
+  assert_json_python 'all(c["instance"] is not None and c["instance"].get("kind")=="opaque" for c in d["scopes"][0]["components"] if c["id"]=="codex_app_server")' 'dual records must carry opaque instances'
+  assert_json_python 'all(len({s["status"] for s in c["signals"] if s["code"]=="process"}) == 1 for c in d["scopes"][0]["components"] if c["id"]=="codex_app_server")' 'no component may carry contradictory process signals'
+  assert_json_python 'any(c["id"]=="codex_app_server" and any(s=={"code":"process","status":"alive-confirmed"} for s in c["signals"]) for c in d["scopes"][0]["components"])' 'missing live record component'
+  assert_json_python 'any(c["id"]=="codex_app_server" and any(s=={"code":"process","status":"dead"} for s in c["signals"]) for c in d["scopes"][0]["components"])' 'missing stale record component'
+}
+
+@test "doctor --json: codex orphan seat is a scoped-nameless global component, never a warning" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  {
+    echo "session=thread-gone"
+    echo "name=gone-role"
+    echo "team=gone"
+    echo "agent=role"
+    echo "type=codex"
+    echo "project=$PROJ"
+  } > "$TEST_SKILL_DIR/run/role-session.gone__role"
+
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 0 ]; then
+    fail_assert "orphan seat must not warn, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_eq '["global_findings"]' "[]"
+  assert_json_python 'any(c["id"]=="codex_role_session" and c["instance"]=={"kind": "registration", "team": "gone", "agent": "role"} and any(s=={"code": "seat", "status": "orphan"} for s in c["signals"]) for c in d["global_components"])' 'missing orphan seat component'
+}
+
 # --- collector failure: diagnostic_failure, never empty-stdout rc 1 ---------
 
 install_failing_plug() {

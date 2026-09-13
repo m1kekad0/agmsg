@@ -32,6 +32,15 @@ setup_test_env() {
   # export is scoped to the test and needs no restore. See #41.
   export HOME="$TEST_SKILL_DIR/home"
   mkdir -p "$HOME"
+
+  # Deterministic process-table view for doctor's untracked-process scan
+  # (codex _doctor.sh `_codex_doctor_process_scan`). Without this seam the
+  # scan reads the real `ps` output, so a dev machine running an actual
+  # Codex app-server would leak "untracked process" warnings into tests that
+  # expect a clean report. A test that wants scan entries writes its own
+  # "pid args" lines into this file.
+  : > "$TEST_SKILL_DIR/ps-snapshot"
+  export AGMSG_DOCTOR_PS_SNAPSHOT="$TEST_SKILL_DIR/ps-snapshot"
 }
 
 teardown_test_env() {
