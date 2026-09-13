@@ -243,7 +243,10 @@ write_bridge_meta() { # $1=key $2=pid $3=project
   run bash "$SCRIPTS/doctor.sh" --type codex
   [ "$status" -eq 1 ]
   out_has "matches no registered project (unknown — not attributed)"
-  out_has "stale app-server pidfile (pid $_dead not running)"
+  # The display line keeps the raw pid for the human; the finding line names
+  # the opaque instance instead (global evidence carries no raw host pids).
+  out_has "Codex app-server: pid $_dead not running"
+  out_has "stale app-server pidfile (pid recorded under global_instance"
   out_has "owning project unknown"
   out_lacks "relaunch Codex through the monitor"
 }
@@ -346,7 +349,10 @@ write_bridge_meta() { # $1=key $2=pid $3=project
   [ "$status" -eq 1 ]
   out_has "0 team(s), 0 registration(s),"
   out_has "matches no registered project (unknown — not attributed)"
-  out_has "stale app-server pidfile (pid $_dead not running)"
+  # Orphan finding: raw pid stays on the display line; the finding names the
+  # opaque instance instead (no raw host pids in global evidence).
+  out_has "Codex app-server: pid $_dead not running"
+  out_has "stale app-server pidfile (pid recorded under global_instance"
   out_has "app-server endpoint is unresponsive (ws://127.0.0.1:64325)"
 }
 
@@ -694,6 +700,35 @@ snapshot_codex_process() { # $1=pid
   kill -0 "$_live"
 }
 
+@test "doctor codex: a dotted team name still claims its bridge key" {
+  # team "foo.bar" + agent "alice" is the bridge key "foo.bar.alice" —
+  # splitting the filename at a dot would misread it as foo/bar.alice and
+  # orphan a live registered bridge (claim is by forward construction).
+  bash "$SCRIPTS/join.sh" foo.bar alice codex "$PROJ" >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'ws://127.0.0.1:64001\n' > "$TEST_SKILL_DIR/run/codex-bridge.foo.bar.alice.appserver"
+
+  local _dead
+  _dead="$(dead_pid)"
+  printf '%s\n' "$_dead" > "$TEST_SKILL_DIR/run/codex-bridge.foo.bar.alice.pid"
+  write_bridge_meta "foo.bar.alice" "$_dead" "$PROJ"
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 1 ]
+  # Claimed: the scoped per-pair verdict names the real key exactly once —
+  # the unattributed global branch never fires a second, opaque stale line.
+  out_has "stale bridge pidfile (foo.bar.alice"
+  [ "$(printf '%s\n' "$output" | grep -cF 'stale bridge pidfile')" -eq 1 ]
+
+  local _live
+  _live="$(foreign_pid)"
+  printf '%s\n' "$_live" > "$TEST_SKILL_DIR/run/codex-bridge.foo.bar.alice.pid"
+  write_bridge_meta "foo.bar.alice" "$_live" "$PROJ"
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 0 ]
+  out_lacks "no registered role claims its key"
+  kill -0 "$_live"
+}
+
 @test "doctor codex: orphan role-session seat is advisory, not a warning" {
   mkdir -p "$TEST_SKILL_DIR/run"
   {
@@ -802,15 +837,52 @@ snapshot_codex_process() { # $1=pid
     echo "#!/usr/bin/env bash"
     echo "# Optional Codex entrypoint shim for agmsg monitor mode"
     echo "# agmsg-shim-owner: $_owner"
-    echo "exit 0"
+    echo "exec $(printf '%q' "$SCRIPTS/drivers/types/codex/codex-shim.sh") \"\$@\""
   } > "$HOME/.agents/bin/codex"
   chmod +x "$HOME/.agents/bin/codex"
 
   PATH="$HOME/.agents/bin:$PATH" run bash "$SCRIPTS/doctor.sh" --type codex
   [ "$status" -eq 0 ]
   out_has "owned by this install"
+  out_has "dispatch target intact"
   out_has "PATH-effective"
   out_has "no warnings."
+}
+
+@test "doctor codex: self-owned shim that never execs codex-shim.sh warns" {
+  # Marker + owner stamp survive a truncated/repointed body — attribution
+  # alone is not dispatch health.
+  mkdir -p "$HOME/.agents/bin"
+  local _owner
+  _owner="$(printf '%q' "$SCRIPTS/drivers/types/codex")"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "# Optional Codex entrypoint shim for agmsg monitor mode"
+    echo "# agmsg-shim-owner: $_owner"
+    echo "exit 0"
+  } > "$HOME/.agents/bin/codex"
+  chmod +x "$HOME/.agents/bin/codex"
+
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 1 ]
+  out_has "owned by this install, but its body never execs this install's codex-shim.sh"
+  out_has "truncated or repointed body"
+  out_lacks "dispatch target intact"
+}
+
+@test "doctor codex: legacy shim that dispatches nowhere warns too" {
+  mkdir -p "$HOME/.agents/bin"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "# Optional Codex entrypoint shim for agmsg monitor mode"
+    echo "exit 0"
+  } > "$HOME/.agents/bin/codex"
+  chmod +x "$HOME/.agents/bin/codex"
+
+  run bash "$SCRIPTS/doctor.sh" --type codex
+  [ "$status" -eq 1 ]
+  out_has "owner unknown, and its body never execs a codex-shim.sh"
+  out_has "predates ownership tracking and never execs a codex-shim.sh"
 }
 
 @test "doctor codex: shim shadowed by another codex is a note, never a warning" {
@@ -821,7 +893,7 @@ snapshot_codex_process() { # $1=pid
     echo "#!/usr/bin/env bash"
     echo "# Optional Codex entrypoint shim for agmsg monitor mode"
     echo "# agmsg-shim-owner: $_owner"
-    echo "exit 0"
+    echo "exec $(printf '%q' "$SCRIPTS/drivers/types/codex/codex-shim.sh") \"\$@\""
   } > "$HOME/.agents/bin/codex"
   chmod +x "$HOME/.agents/bin/codex"
   # A non-shim codex earlier on PATH: the PATH shim is bypassed, but a shell

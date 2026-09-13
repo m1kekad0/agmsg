@@ -715,6 +715,32 @@ write_orphan_appserver() {
   assert_json_python 'any(c["id"]=="codex_app_server" and c["type"]=="codex" and c["instance"] is not None and c["instance"].get("kind")=="opaque" and any(s=={"code": "process", "status": "untracked-live"} for s in c["signals"]) for c in d["global_components"])' 'missing untracked-live component signal'
 }
 
+@test "doctor --json: untracked app-server evidence carries the opaque id, never the raw pid" {
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  configured_off "$PROJ"
+  local _pid
+  _pid="$(confirmed_pid)"
+  printf '%s %s\n' "$_pid" "fakecodex app-server --listen ws://127.0.0.1:0" >> "$AGMSG_DOCTOR_PS_SNAPSHOT"
+
+  # Global-component contract: raw host pids are represented by opaque ids
+  # only — unredacted evidence must not carry the number either.
+  run_json --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for untracked process, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_absent "$_pid" "raw pid in unredacted global finding"
+  assert_json_python 'any("global_instance" in f["evidence"] for f in d["global_findings"] if f["code"]=="codex_process_untracked")' 'untracked finding does not name the opaque instance'
+
+  run_json --type codex --redacted
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for untracked process (redacted), got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_absent "$_pid" "raw pid in redacted payload"
+}
+
 @test "doctor --json: codex stale dispatcher lock is a scoped component finding" {
   bash "$SCRIPTS/leave.sh" team alice >/dev/null
   bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
