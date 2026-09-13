@@ -592,6 +592,53 @@ snapshot_codex_process() { # $1=pid
   out_has "stale dispatcher lock (owner pid $_dead not running)"
 }
 
+@test "doctor codex: --team filters other teams' child locks and bridge bindings" {
+  # A project shared by two teams: team ops's leftovers must not leak into a
+  # --team team report via this plug's per-role loops (the identities list
+  # honours FILTER_TEAM). Delivery's own project-level stale-pidfile line is
+  # out of this plug's reach and stays.
+  bash "$SCRIPTS/join.sh" ops bob codex "$PROJ" >/dev/null
+  local _h _dead
+  _h="$(proj_hash "$PROJ")"
+  _dead="$(dead_pid)"
+  acquire_lock "codex-child:$_h:$(printf '%s' "ops	bob" | agmsg_sha1)" "$_dead"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf '%s\n' "$_dead" > "$TEST_SKILL_DIR/run/codex-bridge.ops.bob.pid"
+  printf '%s' "ws://127.0.0.1:1" > "$TEST_SKILL_DIR/run/codex-bridge.ops.bob.appserver"
+  printf '%s' "thread-b" > "$TEST_SKILL_DIR/run/codex-bridge.ops.bob.thread"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex --team team
+  [ "$status" -eq 1 ]
+  out_lacks "stale bridge-launcher child lock"
+  out_lacks "(ops.bob,"
+
+  # Unfiltered control: both leftovers still surface.
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type codex
+  [ "$status" -eq 1 ]
+  out_has "stale bridge-launcher child lock"
+  out_has "stale bridge pidfile (ops.bob"
+}
+
+@test "doctor codex: live owners under both spellings is a lock conflict" {
+  # Per-spelling lock resources are distinct database keys — two live
+  # owners means two launchers actually run, not one healthy lock.
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team bob codex "$_link" >/dev/null
+  local _phys _other
+  _phys="$(cd "$_link" && pwd -P)"
+  _other="$(foreign_pid)"
+  acquire_lock "codex-dispatcher:$(proj_hash "$_link")" "$$"
+  acquire_lock "codex-dispatcher:$(proj_hash "$_phys")" "$_other"
+
+  run bash "$SCRIPTS/doctor.sh" --project "$_link" --type codex
+  [ "$status" -eq 1 ]
+  out_has "Codex dispatcher lock: held by live pids $$ $_other"
+  out_has "multiple live processes"
+  out_has "duplicate launchers"
+}
+
 @test "doctor codex: bridge binding compares against the live spelling's endpoint" {
   # Registered spelling holds a stale record while the canonical spelling
   # holds the live server — a bridge bound to the live endpoint must not
