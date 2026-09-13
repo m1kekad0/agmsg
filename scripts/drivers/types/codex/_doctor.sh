@@ -422,6 +422,9 @@ _codex_doctor_pair_bindings() {
   fi
   local pairs team name key pidf bridge_pid bound_url bound_thread
   pairs="$("$SCRIPT_DIR/identities.sh" "$project" codex 2>/dev/null || true)"
+  if command -v _team_filter_lines >/dev/null 2>&1; then
+    pairs="$(_team_filter_lines "$pairs" "${FILTER_TEAM:-}")"
+  fi
   [ -n "$pairs" ] || return 0
   while IFS="$(printf '\t')" read -r team name; do
     [ -n "$team" ] || continue
@@ -811,13 +814,15 @@ _codex_doctor_shim_check() {
 # stale evidence of an unclean exit — the next monitor launch CAS-reclaims
 # it (acquire_runtime_lock) — so it is reported, not treated as a blocker.
 _codex_doctor_eval_locks() {
-  local label="$1" team="$2" agent="$3" comp="$4" code="$5"
-  shift 5
+  local label="$1" team="$2" agent="$3" comp="$4" code="$5" conflict_code="$6"
+  shift 6
   local res owner alive="" dead="" _pw
   for res in "$@"; do
     [ -n "$res" ] || continue
     owner="$(agmsg_runtime_lock_owner "$res" 2>/dev/null || true)"
     [ -n "$owner" ] || continue
+    # One pid holding both spelling resources is still one owner.
+    case " $alive $dead " in *" $owner "*) continue ;; esac
     # _local: the owner pid is a launcher shell's $$, minted in the MSYS pid
     # space under Git Bash — same choice acquire_runtime_lock makes (#567).
     if _agmsg_pid_alive_local "$owner" 2>/dev/null; then
@@ -845,6 +850,16 @@ _codex_doctor_eval_locks() {
   else
     _codex_doctor_signal "$comp" "$team" "$agent" lock "held-stale" ""
   fi
+  # Distinct live owners cannot be one launcher: the per-spelling resources
+  # are separate database keys (codex-bridge-launcher builds each from its
+  # own PROJECT_HASH), so they never block each other — two live owners is
+  # a real duplicate-launcher conflict, not a single healthy lock.
+  case "$alive" in
+    *" "*)
+      _codex_doctor_warn "$conflict_code" "$team" "$agent" "$comp" \
+        "$label lock is held by multiple live processes (pids $alive) — lock resources under different path spellings are distinct keys and do not block each other; duplicate launchers may be running" ""
+      ;;
+  esac
   if [ -n "$dead" ]; then
     _pw="pid"; case "$dead" in *" "*) _pw="pids" ;; esac
     _codex_doctor_warn "$code" "$team" "$agent" "$comp" \
@@ -859,20 +874,26 @@ _codex_doctor_eval_locks() {
 # $3 are the registered-spelling and canonical-spelling project hashes: the
 # launcher hashes whichever spelling it was launched under, so a lock can sit
 # under either — both resources are passed to the aggregation above, which
-# emits one verdict per component.
+# emits one verdict per component. Role identity lines are narrowed by
+# doctor.sh's --team filter so a scan of team A never reports team B's lock.
 _codex_doctor_pair_locks() {
   local project="$1" hash="$2" canon_hash="${3:-}" db
   command -v agmsg_runtime_lock_owner >/dev/null 2>&1 || return 0
   db="$(_agmsg_runtime_db_path 2>/dev/null || true)"
   [ -n "$db" ] && [ -f "$db" ] || return 0
-  local team name tab child_res alt
+  local team name tab child_res alt idents
   tab="$(printf '\t')"
   alt=""
   if [ -n "$canon_hash" ] && [ "$canon_hash" != "$hash" ]; then
     alt="codex-dispatcher:$canon_hash"
   fi
   _codex_doctor_eval_locks "dispatcher" "" "" codex_dispatcher \
-    codex_dispatcher_lock_stale "codex-dispatcher:$hash" "$alt"
+    codex_dispatcher_lock_stale codex_dispatcher_lock_conflict \
+    "codex-dispatcher:$hash" "$alt"
+  idents="$("$SCRIPT_DIR/identities.sh" "$project" codex 2>/dev/null || true)"
+  if command -v _team_filter_lines >/dev/null 2>&1; then
+    idents="$(_team_filter_lines "$idents" "${FILTER_TEAM:-}")"
+  fi
   while IFS="$tab" read -r team name; do
     [ -n "$team" ] && [ -n "$name" ] || continue
     child_res="$(printf '%s' "${team}${tab}${name}" | agmsg_sha1 2>/dev/null)"
@@ -881,8 +902,9 @@ _codex_doctor_pair_locks() {
       alt="codex-child:$canon_hash:$child_res"
     fi
     _codex_doctor_eval_locks "bridge-launcher child" "$team" "$name" \
-      codex_child codex_child_lock_stale "codex-child:$hash:$child_res" "$alt"
-  done <<< "$("$SCRIPT_DIR/identities.sh" "$project" codex 2>/dev/null || true)"
+      codex_child codex_child_lock_stale codex_child_lock_conflict \
+      "codex-child:$hash:$child_res" "$alt"
+  done <<< "$idents"
   return 0
 }
 
@@ -917,15 +939,30 @@ agmsg_doctor_extra_collect() {
       || [ -f "$RUN_DIR/codex-app-server.$canon_hash.version" ]; }; then
     _canon_has=1
   fi
+  # Two record sets are two objects: giving each its own opaque instance
+  # keeps their signals from merging into one contradictory null-instance
+  # codex_app_server component (a stale raw record beside a healthy
+  # canonical record would otherwise read as process=dead AND
+  # process=alive-confirmed on one component). Seeding the pseudonym from
+  # the record's hash makes the scoped instance correlate with any
+  # global-orphan component for the same record set.
+  local _canon_opaque="" _raw_opaque=""
+  if [ "$_raw_has" -eq 1 ] && [ "$_canon_has" -eq 1 ]; then
+    _codex_doctor_opaque_for "$canon_hash"; _canon_opaque="$_CODEX_OPAQUE_OUT"
+    _codex_doctor_opaque_for "$hash"; _raw_opaque="$_CODEX_OPAQUE_OUT"
+  fi
   # Evaluate the canonical-spelling record first when it exists so the raw
   # hash's "no record" line never contradicts a record that is really there.
   if [ "$_canon_has" -eq 1 ]; then
     _codex_doctor_display "Codex app-server: a record set exists under this project's canonical spelling"
-    _codex_doctor_eval_appserver "$canon_hash" 1
+    _codex_doctor_eval_appserver "$canon_hash" 1 "$_canon_opaque"
     _canon_pid_state="$_CODEX_DOCTOR_EVAL_PID_STATE"
   fi
   if [ "$_raw_has" -eq 1 ] || [ "$_canon_has" -eq 0 ]; then
-    _codex_doctor_eval_appserver "$hash" 1
+    if [ "$_canon_has" -eq 1 ]; then
+      _codex_doctor_display "Codex app-server: record set under this project's registered spelling"
+    fi
+    _codex_doctor_eval_appserver "$hash" 1 "$_raw_opaque"
     _raw_pid_state="$_CODEX_DOCTOR_EVAL_PID_STATE"
   fi
   if [ "$_raw_pid_state" = "alive-confirmed" ] \

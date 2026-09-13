@@ -763,6 +763,36 @@ write_orphan_appserver() {
   assert_json_python 'sum(1 for f in d["scopes"][0]["findings"] if f["code"]=="codex_dispatcher_lock_stale") == 1' 'expected exactly one stale-lock finding'
 }
 
+@test "doctor --json: codex dual-spelling records are two components, not merged signals" {
+  # Registered spelling holds a dead record, canonical spelling the live
+  # server — both are real record sets, so each gets its own component
+  # instance instead of merging contradictory signals into one.
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null
+  local _real="$TEST_SKILL_DIR/real-proj" _link="$TEST_SKILL_DIR/link-proj"
+  mkdir -p "$_real"
+  ln -s "$_real" "$_link"
+  bash "$SCRIPTS/join.sh" team alice codex "$_link" >/dev/null
+  configured_off "$_link"
+  local _phys _live_port _live_pid _dead
+  _phys="$(cd "$_link" && pwd -P)"
+  _live_port="$(start_listener "$TEST_SKILL_DIR/port.txt")"
+  _live_pid="$(confirmed_pid)"
+  _dead="$(dead_pid)"
+  write_appserver "$_link" "$_dead" "1" "codex-cli 9.9.9-test"
+  write_appserver "$_phys" "$_live_pid" "$_live_port" "codex-cli 9.9.9-test"
+
+  run_json --project "$_link" --type codex
+  if [ "$JSON_STATUS" -ne 1 ]; then
+    fail_assert "expected rc 1 for the stale record, got $JSON_STATUS"
+  fi
+  assert_valid_json
+  assert_json_python 'sum(1 for c in d["scopes"][0]["components"] if c["id"]=="codex_app_server") == 2' 'expected two distinct codex_app_server components'
+  assert_json_python 'all(c["instance"] is not None and c["instance"].get("kind")=="opaque" for c in d["scopes"][0]["components"] if c["id"]=="codex_app_server")' 'dual records must carry opaque instances'
+  assert_json_python 'all(len({s["status"] for s in c["signals"] if s["code"]=="process"}) == 1 for c in d["scopes"][0]["components"] if c["id"]=="codex_app_server")' 'no component may carry contradictory process signals'
+  assert_json_python 'any(c["id"]=="codex_app_server" and any(s=={"code":"process","status":"alive-confirmed"} for s in c["signals"]) for c in d["scopes"][0]["components"])' 'missing live record component'
+  assert_json_python 'any(c["id"]=="codex_app_server" and any(s=={"code":"process","status":"dead"} for s in c["signals"]) for c in d["scopes"][0]["components"])' 'missing stale record component'
+}
+
 @test "doctor --json: codex orphan seat is a scoped-nameless global component, never a warning" {
   bash "$SCRIPTS/leave.sh" team alice >/dev/null
   bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
