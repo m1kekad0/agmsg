@@ -349,12 +349,21 @@ _codex_doctor_eval_appserver() {
   _codex_doctor_signal codex_app_server "" "" endpoint "$ep_state" "$opaque"
   _codex_doctor_signal codex_app_server "" "" version "$ver_state" "$opaque"
 
+  # Evidence wording for the recorded pid: scoped findings may name the raw
+  # number (existing convention), but GLOBAL findings (attributed=0, orphan
+  # records) must not — a bare pid survives --redacted (the pseudonym table
+  # only holds namespaced keys) and leaks a host identifier into paste-safe
+  # output. The display lines above keep the number for the human either
+  # way; the finding refers to the opaque instance instead.
+  local _pidref="pid $pid_raw"
+  if [ "$attributed" -eq 0 ]; then _pidref="pid recorded under $opaque"; fi
+
   # --- warnings: one independent rule per signal. Combined states surface as
   # several warnings, never as a single verdict that needs all of them.
   case "$pid_state" in
     invalid) _codex_doctor_warn codex_pid_invalid "" "" codex_app_server "stale app-server pid record (invalid pid '$pid_raw')" "$opaque" ;;
-    dead) _codex_doctor_warn codex_pid_stale "" "" codex_app_server "stale app-server pidfile (pid $pid_raw not running)" "$opaque" ;;
-    alive-foreign) _codex_doctor_warn codex_pid_foreign "" "" codex_app_server "app-server pid $pid_raw is alive but is not a Codex app-server (possible pid reuse); the record does not point at a live server" "$opaque" ;;
+    dead) _codex_doctor_warn codex_pid_stale "" "" codex_app_server "stale app-server pidfile ($_pidref not running)" "$opaque" ;;
+    alive-foreign) _codex_doctor_warn codex_pid_foreign "" "" codex_app_server "app-server $_pidref is alive but is not a Codex app-server (possible pid reuse); the record does not point at a live server" "$opaque" ;;
   esac
   if [ "$pid_state" = "none" ] && [ "$have_portf" -eq 1 ]; then
     _codex_doctor_warn codex_records_incomplete "" "" codex_app_server "app-server endpoint record exists but the pid record is missing (incomplete state)" "$opaque"
@@ -369,13 +378,13 @@ _codex_doctor_eval_appserver() {
   # ordinary startup race (pid written, port banner not yet parsed) and stays
   # silent below.
   if [ "$pid_state" = "alive-confirmed" ] && [ "$ep_state" = "none" ] && [ "$have_verf" -eq 1 ]; then
-    _codex_doctor_warn codex_records_incomplete "" "" codex_app_server "app-server pid $pid_raw is alive but the port record is missing while a version record exists (incomplete state — not a startup race)" "$opaque"
+    _codex_doctor_warn codex_records_incomplete "" "" codex_app_server "app-server $_pidref is alive but the port record is missing while a version record exists (incomplete state — not a startup race)" "$opaque"
   fi
   if [ "$ep_state" = "invalid" ]; then
     _codex_doctor_warn codex_endpoint_invalid "" "" codex_app_server "stale app-server endpoint record (invalid port '$port_raw')" "$opaque"
   fi
   if [ "$ep_state" = "silent" ] && [ "$pid_state" = "alive-confirmed" ]; then
-    _codex_doctor_warn codex_endpoint_unresponsive "" "" codex_app_server "app-server process is alive (pid $pid_raw) but its endpoint is unresponsive ($url)" "$opaque"
+    _codex_doctor_warn codex_endpoint_unresponsive "" "" codex_app_server "app-server process is alive ($_pidref) but its endpoint is unresponsive ($url)" "$opaque"
   fi
   if [ "$ep_state" = "silent" ] && [ "$pid_state" != "alive-confirmed" ] && [ "$pid_state" != "alive-unverified" ]; then
     _codex_doctor_warn codex_endpoint_unresponsive "" "" codex_app_server "app-server endpoint is unresponsive ($url)" "$opaque"
@@ -386,7 +395,7 @@ _codex_doctor_eval_appserver() {
         _codex_doctor_warn codex_endpoint_foreign "" "" codex_app_server "endpoint $url answers but no live recorded server owns it (another process may hold the port)" "$opaque"
         ;;
       alive-foreign)
-        _codex_doctor_warn codex_endpoint_foreign "" "" codex_app_server "endpoint $url answers but the recorded pid $pid_raw is not a Codex app-server (ownership unproven)" "$opaque"
+        _codex_doctor_warn codex_endpoint_foreign "" "" codex_app_server "endpoint $url answers but the recorded $_pidref is not a Codex app-server (ownership unproven)" "$opaque"
         ;;
     esac
   fi
@@ -551,6 +560,7 @@ _codex_doctor_registered_pairs() {
 # the orphan-seat pass so neither recomputes the installation's pair set).
 _codex_doctor_global_bindings() {
   local tab pair_union pidf key bridge_pid bound_url bound_thread bound_port seated _gopaque _gdisplay
+  local _claimed _pt _pa
   tab="$(printf '\t')"
   pair_union="$1"
   for pidf in "$RUN_DIR"/codex-bridge.*.pid; do
@@ -558,9 +568,16 @@ _codex_doctor_global_bindings() {
     key="${pidf##*/codex-bridge.}"
     key="${key%.pid}"
     case "$key" in ''|*/*) continue ;; esac
-    case $'\n'"$pair_union"$'\n' in
-      *$'\n'"${key%%.*}${tab}${key#*.}"$'\n'*) continue ;;
-    esac
+    # A registered pair claims its key by FORWARD construction (team.agent):
+    # the filename cannot be split back — team "foo.bar" + agent "alice" is
+    # the key "foo.bar.alice", which a first-dot split would misread as
+    # foo/bar.alice and orphan a live registered bridge.
+    _claimed=0
+    while IFS="$tab" read -r _pt _pa; do
+      [ -n "$_pt" ] && [ -n "$_pa" ] || continue
+      if [ "$key" = "$_pt.$_pa" ]; then _claimed=1; break; fi
+    done <<< "$pair_union"
+    [ "$_claimed" -eq 1 ] && continue
     bridge_pid="$(_codex_doctor_read_record "$pidf")"
     # Keys without launcher sidecars belong to delivery.sh's own per-role
     # verdicts (see the per-pair comment above) WHEN their role is still
@@ -578,7 +595,10 @@ _codex_doctor_global_bindings() {
         _codex_doctor_signal codex_bridge "" "" seat "unknown" "$_gopaque"
       else
         _codex_doctor_display "Codex bridge: $_gopaque not running (pid '${bridge_pid:-empty}')"
-        _codex_doctor_warn codex_bridge_stale_pidfile "" "" codex_bridge "stale bridge pidfile ($_gopaque, pid '${bridge_pid:-empty}' not running)" "$_gopaque"
+        # Global findings keep host pids out of structured evidence — the
+        # opaque instance stands in for them (raw pids stay on the
+        # human-only display line above).
+        _codex_doctor_warn codex_bridge_stale_pidfile "" "" codex_bridge "stale bridge pidfile ($_gopaque — recorded pid not running)" "$_gopaque"
         _codex_doctor_signal codex_bridge "" "" process "not-running" "$_gopaque"
         _codex_doctor_signal codex_bridge "" "" endpoint "unknown" "$_gopaque"
         _codex_doctor_signal codex_bridge "" "" seat "unknown" "$_gopaque"
@@ -628,7 +648,9 @@ _codex_doctor_global_bindings() {
       fi
     else
       _codex_doctor_display "Codex bridge binding: $_gdisplay not running (pid '${bridge_pid:-empty}')"
-      _codex_doctor_warn codex_bridge_stale_pidfile "" "" codex_bridge "stale bridge pidfile ($_gdisplay, pid '${bridge_pid:-empty}' not running)" "$_gopaque"
+      # Same global-evidence rule as the no-sidecar branch: no raw host pid
+      # in the finding — the opaque instance is its stand-in.
+      _codex_doctor_warn codex_bridge_stale_pidfile "" "" codex_bridge "stale bridge pidfile ($_gdisplay — recorded pid not running)" "$_gopaque"
       _codex_doctor_signal codex_bridge "" "" process "not-running" "$_gopaque"
       _codex_doctor_signal codex_bridge "" "" endpoint "unknown" "$_gopaque"
       _codex_doctor_signal codex_bridge "" "" seat "unknown" "$_gopaque"
@@ -686,8 +708,12 @@ _codex_doctor_untracked_processes() {
     _agmsg_pid_alive_local "$spid" 2>/dev/null || continue
     _codex_doctor_opaque_for "appserver-pid:$spid"
     _codex_doctor_display "Codex app-server process: pid $spid is live but no record tracks it ($_CODEX_OPAQUE_OUT)"
+    # Global evidence must not carry the raw host pid: the pseudonym table
+    # holds "appserver-pid:<pid>", never the bare number, so a literal pid
+    # here would also survive --redacted. The display line keeps it for the
+    # human; the finding refers to the opaque instance instead.
     _codex_doctor_warn codex_process_untracked "" "" codex_app_server \
-      "live Codex app-server process pid $spid is not tracked by any record in this install (a manual 'codex app-server' or another install may own it — ambiguous; verify before stopping)" \
+      "live Codex app-server process ($_CODEX_OPAQUE_OUT) is not tracked by any record in this install (a manual 'codex app-server' or another install may own it — ambiguous; verify before stopping)" \
       "$_CODEX_OPAQUE_OUT"
     _codex_doctor_signal codex_app_server "" "" process "untracked-live" "$_CODEX_OPAQUE_OUT"
   done <<< "$scan"
@@ -757,17 +783,44 @@ _codex_doctor_shim_check() {
   # attributed to nothing and stay "unknown".
   owner="$(sed -n 's/^# agmsg-shim-owner: //p' "$shim_bin" 2>/dev/null | head -1)"
   if [ -z "$owner" ]; then
-    _codex_doctor_display "Codex shim: installed ($shim_bin), owner unknown (predates ownership tracking)"
-    _codex_doctor_signal codex_shim "" "" owner "legacy-unknown" ""
+    # A legacy shim predates the owner stamp, so which install it should
+    # dispatch into cannot be proven — but whether it dispatches into ANY
+    # codex-shim.sh can: a marker+body truncated to `exit 0` routes nowhere.
+    if grep -q '^exec .*codex-shim\.sh' "$shim_bin" 2>/dev/null; then
+      _codex_doctor_display "Codex shim: installed ($shim_bin), owner unknown (predates ownership tracking)"
+      _codex_doctor_signal codex_shim "" "" owner "legacy-unknown" ""
+      _codex_doctor_signal codex_shim "" "" dispatch "unverified" ""
+    else
+      _codex_doctor_display "Codex shim: installed ($shim_bin), owner unknown, and its body never execs a codex-shim.sh"
+      _codex_doctor_signal codex_shim "" "" owner "legacy-unknown" ""
+      _codex_doctor_signal codex_shim "" "" dispatch "missing" ""
+      _codex_doctor_warn codex_shim_no_dispatch "" "" codex_shim \
+        "codex shim $shim_bin predates ownership tracking and never execs a codex-shim.sh (truncated or repointed body); launches through it reach no monitor" ""
+    fi
   elif [ "$owner" = "$(printf '%q' "$codex_dir")" ]; then
-    if [ -f "$codex_dir/codex-shim.sh" ] && [ -f "$SKILL_DIR/scripts/delivery.sh" ]; then
+    # The owner stamp proves attribution, not content: a truncated or
+    # repointed body keeps marker+owner while no longer execing anywhere
+    # (a bare `exit 0` reads as a healthy shim). The only line that routes
+    # launches is the exact `exec <this install>/codex-shim.sh "$@"` the
+    # installer writes (same %q quoting) — require it verbatim, plus an
+    # executable exec target, before reporting the dispatch intact.
+    local _expected_exec="exec $(printf '%q' "$codex_dir/codex-shim.sh") \"\$@\""
+    if ! grep -qxF "$_expected_exec" "$shim_bin" 2>/dev/null; then
+      _codex_doctor_display "Codex shim: installed ($shim_bin), owned by this install, but its body never execs this install's codex-shim.sh"
+      _codex_doctor_signal codex_shim "" "" owner "self" ""
+      _codex_doctor_signal codex_shim "" "" dispatch "missing" ""
+      _codex_doctor_warn codex_shim_no_dispatch "" "" codex_shim \
+        "codex shim $shim_bin is stamped as owned by this install but never execs this install's codex-shim.sh (truncated or repointed body); monitor launches through it do not reach the monitor" ""
+    elif [ -x "$codex_dir/codex-shim.sh" ] && [ -f "$SKILL_DIR/scripts/delivery.sh" ]; then
       _codex_doctor_display "Codex shim: installed ($shim_bin), owned by this install, dispatch target intact"
       _codex_doctor_signal codex_shim "" "" owner "self" ""
+      _codex_doctor_signal codex_shim "" "" dispatch "intact" ""
     else
       _codex_doctor_display "Codex shim: installed ($shim_bin), owned by this install, but its dispatch target is incomplete"
       _codex_doctor_signal codex_shim "" "" owner "self" ""
+      _codex_doctor_signal codex_shim "" "" dispatch "target-incomplete" ""
       _codex_doctor_warn codex_shim_broken_target "" "" codex_shim \
-        "codex shim $shim_bin points at this install but the driver directory is missing pieces (codex-shim.sh or delivery.sh); launches through the shim fall back to plain codex" ""
+        "codex shim $shim_bin points at this install but the driver directory is missing pieces or codex-shim.sh is not executable; launches through the shim fall back to plain codex" ""
     fi
   else
     _codex_doctor_display "Codex shim: installed ($shim_bin), owned by a different agmsg install ($owner)"
