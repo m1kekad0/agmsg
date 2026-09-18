@@ -96,19 +96,21 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/lib/resolve-project.sh"
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/lib/actas-lock.sh"
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/lib/type-registry.sh"
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/lib/validate.sh"
-# Shared structured delivery evaluator (P1-4): doctor は human text を parse
-# せず、この evaluator を直接呼ぶ。human renderer も同一 evaluator から
-# 描画するため wording 変更では machine JSON は壊れない。
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/lib/delivery-eval.sh"
+
+# --json is serialized by a Python helper (escaping / schema shaping live
+# there, not in Bash string concatenation -- the same split team-list.sh /
+# scripts/internal/team-list.py already uses). A missing python3 means no
+# authoritative report can be produced, so this is a resolution-class error
+# (exit 2, stdout empty, human text on stderr), never a degraded JSON run.
+# lib source 群・ERR trap 双方より前に置く: 「python3 が無い」は他の
+# source-time 失敗 (例: type-registry.sh の source-time paste) より先に、
+# また trap の "internal failure" メッセージに紛れずに報告されるべき
+# 依存エラーである。
+if [ "$JSON_MODE" -eq 1 ]; then
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/lib/require-python3.sh"
+  agmsg_require_python3 "doctor --json" || exit 2
+fi
 
 # --- fatal-error boundary for --json (P1-2) --------------------------------
 # JSON mode では scan 全体を明示的な boundary で保護する: unexpected
@@ -126,21 +128,25 @@ if [ "$JSON_MODE" -eq 1 ]; then
   # ERR trap を functions/command substitutions/subshells へ継承させる
   # (errtrace)。mktemp/store write 等の $(...) 内失敗も rc2 へ正規化する
   # ため。`||` で明示処理した per-scope partial (diagnostic_failure) は
-  # trap を発火させない。
+  # trap を発火させない。lib source 群より前に置く: source 時点の失敗
+  # も境界内へ正規化する。
   set -E
   trap '_doctor_json_err_trap' ERR
 fi
 
-# --json is serialized by a Python helper (escaping / schema shaping live
-# there, not in Bash string concatenation -- the same split team-list.sh /
-# scripts/internal/team-list.py already uses). A missing python3 means no
-# authoritative report can be produced, so this is a resolution-class error
-# (exit 2, stdout empty, human text on stderr), never a degraded JSON run.
-if [ "$JSON_MODE" -eq 1 ]; then
-  # shellcheck disable=SC1091
-  . "$SCRIPT_DIR/lib/require-python3.sh"
-  agmsg_require_python3 "doctor --json" || exit 2
-fi
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/actas-lock.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/type-registry.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/validate.sh"
+# Shared structured delivery evaluator (P1-4): doctor は human text を parse
+# せず、この evaluator を直接呼ぶ。human renderer も同一 evaluator から
+# 描画するため wording 変更では machine JSON は壊れない。
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/delivery-eval.sh"
 
 # --project / --type / --team all validated here, before any scope work:
 # an unknown --type or --team is a usage error (exit 2), not left to fail
